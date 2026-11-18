@@ -1,11 +1,57 @@
 // File: backend/routes/people.js
 const express = require('express');
+const { applyOutcome } = require('../utils/geocodeOutcome');
+const { mergeOsintFindings } = require('../utils/osintFindings');
 const router = express.Router();
 const { pool } = require('../config/database');
 const { requireAuth } = require('../middleware/auth');
-const { validatePersonData, validateIdParam } = require('../middleware/validation');
+const { validateIdParam } = require('../middleware/validation');
+const { validate, PersonCreateSchema, PersonUpdateSchema, PersonOsintAppendSchema } = require('../middleware/schemas');
 const logAudit = require('../utils/logAudit');
+const { apiLimiter } = require('../middleware/rateLimiters');
+const { syncPersonConnections, addReverseConnections } = require('./relationships');
+const { inTransaction } = require('../utils/db');
+const { removeEntityLinks } = require('../utils/entityLinks');
+const { connectionsSql, incomingConnectionsSql, isAdmin } = require('../utils/personConnectionsSql');
+const { checkCaseProjectConsistency, resolvePersonCase } = require('../utils/projectConsistency');
+const { applyProjectScope, requireProjectMember } = require('../utils/projectAccess');
 
+// connections is backed by the relationships table (issue #83), not the
+// stored JSONB column -- computed here so frontend consumers that read
+// person.connections keep working. Listed AFTER `p.*` on purpose: pg keeps
+// the LAST column when two share a name, so this wins over the raw column.
+// incoming_connections (#112): connections other people made to this person,
+// so their page shows who links to them even when that person isn't loaded.
+// Both come from utils/personConnectionsSql.js (shared with Advanced Search).
+const PERSON_CONNECTIONS_SUBQUERY = connectionsSql('p');
+const incomingConnectionsSubquery = (viewerParam) => incomingConnectionsSql('p', viewerParam);
+
+async function fetchPersonById(id, req) {
+  const params = [id];
+  if (!isAdmin(req)) params.push(req.session.userId);
+  const result = await pool.query(
+    `SELECT p.*, CONCAT_WS(' ', p.first_name, NULLIF(p.patronymic, ''), NULLIF(p.last_name, '')) as full_name,
+            ${PERSON_CONNECTIONS_SUBQUERY}, ${incomingConnectionsSubquery(isAdmin(req) ? null : '$2')}
+     FROM people p WHERE p.id = $1`,
+    params
+  );
+  return result.rows[0];
+}
+
+// Two-way connections (#112) add a connection on the other person; record it
+// in that person's history, after the save has committed.
+async function auditReverseConnections(personId, added, userId) {
+  for (const a of added) {
+    await logAudit('person', a.person_id, 'update', {
+      connections: { oldValue: null, newValue: `Added "${a.type}" connection to person #${personId} (two-way connection made from person #${personId})` },
+    }, userId);
+  }
+}
+const canEditProject = (req) => (projectId) => requireProjectMember(req, projectId);
+// The two-way tick is an instruction, not part of the stored connection.
+const storedConnections = (connections) => (Array.isArray(connections) ? connections : []).map(({ two_way: _t, ...c }) => c);
+
+router.use(apiLimiter);
 // GET / — paginated people list
 router.get('/', requireAuth, async (req, res) => {
   try {
@@ -14,13 +60,23 @@ router.get('/', requireAuth, async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit, 10) || 100, 1000);
     const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
 
+    const where = [];
+    const params = [];
+    const scopeErr = await applyProjectScope(req, 'p', where, params);
+    if (scopeErr) return res.status(403).json({ error: scopeErr });
+    if (req.query.case_id) { params.push(parseInt(req.query.case_id, 10)); where.push(`p.case_id = $${params.length}`); }
+    const whereClause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+
+    const dataParams = isAdmin(req) ? [...params] : [...params, req.session.userId];
+    const viewerParam = isAdmin(req) ? null : `$${dataParams.length}`;
     const [dataResult, countResult] = await Promise.all([
       pool.query(
-        `SELECT *, CONCAT(first_name, ' ', COALESCE(last_name, '')) as full_name
-         FROM people ORDER BY created_at DESC LIMIT $1 OFFSET $2`,
-        [limit, offset]
+        `SELECT p.*, CONCAT_WS(' ', p.first_name, NULLIF(p.patronymic, ''), NULLIF(p.last_name, '')) as full_name,
+                ${PERSON_CONNECTIONS_SUBQUERY}, ${incomingConnectionsSubquery(viewerParam)}
+         FROM people p ${whereClause} ORDER BY p.created_at DESC, p.id DESC LIMIT $${dataParams.length + 1} OFFSET $${dataParams.length + 2}`,
+        [...dataParams, limit, offset]
       ),
-      pool.query('SELECT COUNT(*)::int AS count FROM people'),
+      pool.query(`SELECT COUNT(*)::int AS count FROM people p ${whereClause}`, params),
     ]);
 
     const total = countResult.rows[0].count;
@@ -34,14 +90,19 @@ router.get('/', requireAuth, async (req, res) => {
 });
 
 // POST / — create person
-router.post('/', requireAuth, validatePersonData, async (req, res) => {
+router.post('/', requireAuth, validate(PersonCreateSchema), async (req, res) => {
   const {
-    firstName, lastName, aliases, dateOfBirth, category, status, crmStatus,
-    caseName, profilePictureUrl, notes, osintData, attachments, connections,
+    firstName, lastName, patronymic, aliases, dateOfBirth, category, status, crmStatus,
+    caseName, case_id, project_id, profilePictureUrl, notes, osintData, attachments, connections,
     locations, custom_fields
   } = req.body;
 
-  if (!firstName) return res.status(400).json({ error: 'First name is required' });
+  const accessErr = await requireProjectMember(req, project_id);
+  if (accessErr) return res.status(403).json({ error: accessErr });
+
+  const caseErr = await checkCaseProjectConsistency(case_id, project_id);
+  if (caseErr) return res.status(400).json({ error: caseErr });
+  const personCase = await resolvePersonCase({ case_id, caseName }, project_id);
 
   // Geocode locations before saving using improved service if available.
   // Always merge results back into the original array so already-geocoded entries
@@ -60,13 +121,15 @@ router.post('/', requireAuth, validatePersonData, async (req, res) => {
       if (improvedGeocodingService) {
         const geocoded = await improvedGeocodingService.batchGeocode(locationsToGeocode, {
           minConfidence: 30,
-          maxConcurrent: 3
+          maxConcurrent: 3,
+          projectId: project_id
         });
         // Merge geocoded results back by reference into the original array
         for (let i = 0; i < geocoded.length; i++) {
           const idx = geocodedLocations.indexOf(locationsToGeocode[i]);
-          if (idx >= 0 && geocoded[i] && !geocoded[i].failure) {
-            geocodedLocations[idx] = { ...locationsToGeocode[i], ...geocoded[i] };
+          // Coordinates, or why there are none (issue #110).
+          if (idx >= 0 && geocoded[i]) {
+            geocodedLocations[idx] = applyOutcome(locationsToGeocode[i], geocoded[i]);
           }
         }
       } else if (batchGeocode) {
@@ -91,62 +154,109 @@ router.post('/', requireAuth, validatePersonData, async (req, res) => {
     }
   }
 
+  // connections is intentionally not written here (issue #83) -- it's now
+  // backed by the relationships table, synced below once the person exists.
   const query = `
-    INSERT INTO people (first_name, last_name, aliases, date_of_birth, category, status, crm_status, case_name, profile_picture_url, notes, osint_data, attachments, connections, locations, custom_fields)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-    RETURNING *, CONCAT(first_name, ' ', COALESCE(last_name, '')) as full_name;
+    INSERT INTO people (first_name, last_name, patronymic, aliases, date_of_birth, category, status, crm_status, case_name, case_id, project_id, profile_picture_url, notes, osint_data, attachments, locations, custom_fields)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+    RETURNING *, CONCAT_WS(' ', first_name, NULLIF(patronymic, ''), NULLIF(last_name, '')) as full_name;
   `;
 
   const values = [
     firstName,
     lastName || null,
+    patronymic || null,
     aliases || [],
     dateOfBirth || null,
     category || null,
     status || null,
     crmStatus || null,
-    caseName || null,
+    personCase.case_name,
+    personCase.case_id,
+    project_id,
     profilePictureUrl || null,
     notes || null,
     JSON.stringify(osintData || []),
     JSON.stringify(attachments || []),
-    JSON.stringify(connections || []),
     JSON.stringify(geocodedLocations),
     JSON.stringify(custom_fields || {})
   ];
 
   try {
-    const result = await pool.query(query, values);
-    const newPerson = result.rows[0];
+    // The person and their connections commit together, or not at all.
+    const { created, reverseAdded } = await inTransaction(async (client) => {
+      const { rows } = await client.query(query, values);
+      await syncPersonConnections(rows[0].id, rows[0].project_id, rows[0].case_id, connections, client, canEditProject(req));
+      const added = await addReverseConnections(rows[0].id, connections, canEditProject(req), client);
+      return { created: rows[0], reverseAdded: added };
+    });
+    const newPerson = await fetchPersonById(created.id, req);
+    await auditReverseConnections(newPerson.id, reverseAdded, req.session?.userId);
 
     // Log audit
     await logAudit('person', newPerson.id, 'create', {
       record: { oldValue: null, newValue: JSON.stringify(newPerson) }
-    });
+    }, req.session?.userId);
 
     res.status(201).json(newPerson);
   } catch (err) {
+    if (err.statusCode) return res.status(err.statusCode).json({ error: err.message });
     console.error('Error creating person:', err.message, err.stack);
     res.status(500).json({ error: 'Failed to create person' });
   }
 });
 
+// GET /:id — get single person by ID
+router.get('/:id', requireAuth, validateIdParam, async (req, res) => {
+  try {
+    const person = await fetchPersonById(req.params.id, req);
+    if (!person) {
+      return res.status(404).json({ error: 'Person not found' });
+    }
+
+    const accessErr = await requireProjectMember(req, person.project_id);
+    if (accessErr) return res.status(403).json({ error: accessErr });
+
+    res.json(person);
+  } catch (err) {
+    console.error('Error fetching person:', err.message);
+    res.status(500).json({ error: 'Failed to fetch person' });
+  }
+});
+
 // PUT /:id — update person
-router.put('/:id', requireAuth, validateIdParam, validatePersonData, async (req, res) => {
+router.put('/:id', requireAuth, validateIdParam, validate(PersonUpdateSchema), async (req, res) => {
   const personId = req.params.id;
   const {
-    firstName, lastName, aliases, dateOfBirth, category, status, crmStatus,
-    caseName, profilePictureUrl, notes, osintData, attachments, connections,
+    firstName, lastName, patronymic, aliases, dateOfBirth, category, status, crmStatus,
+    caseName, case_id, profilePictureUrl, notes, osintData, attachments, connections,
     locations, custom_fields
   } = req.body;
 
-  if (!firstName) return res.status(400).json({ error: 'First name is required for update' });
-
   try {
-    // Get old values for audit
+    // Get old values for audit. connections comes from relationships now, not
+    // the (stale-for-reads) raw column, so it's fetched separately.
     const oldResult = await pool.query('SELECT * FROM people WHERE id = $1', [personId]);
     if (oldResult.rows.length === 0) return res.status(404).json({ error: 'Person not found' });
     const oldPerson = oldResult.rows[0];
+
+    const accessErr = await requireProjectMember(req, oldPerson.project_id);
+    if (accessErr) return res.status(403).json({ error: accessErr });
+
+    const oldConnectionsResult = await pool.query(
+      `SELECT jsonb_build_object('person_id', target_id, 'type', relationship_type, 'note', note) AS c
+       FROM relationships WHERE source_type = 'person' AND source_id = $1 AND target_type = 'person'`,
+      [personId]
+    );
+    const oldConnections = oldConnectionsResult.rows.map((r) => r.c);
+
+    const caseErr = await checkCaseProjectConsistency(case_id, oldPerson.project_id);
+    if (caseErr) return res.status(400).json({ error: caseErr });
+    const personCase = await resolvePersonCase({ case_id, caseName }, oldPerson.project_id);
+    // Several screens save a person without the patronymic field (adding
+    // people from Case Management, the table's inline edit, the bulk tool):
+    // keep the stored one then. An empty string still clears it.
+    const newPatronymic = patronymic === undefined ? oldPerson.patronymic : (patronymic || null);
 
     // Geocode any locations that don't have coordinates using improved service if available.
     // Always merge results back into the original array so already-geocoded entries
@@ -165,13 +275,15 @@ router.put('/:id', requireAuth, validateIdParam, validatePersonData, async (req,
         if (improvedGeocodingService) {
           const geocoded = await improvedGeocodingService.batchGeocode(locationsToGeocode, {
             minConfidence: 30,
-            maxConcurrent: 3
+            maxConcurrent: 3,
+            projectId: oldPerson.project_id
           });
           // Merge geocoded results back by reference into the original array
           for (let i = 0; i < geocoded.length; i++) {
             const idx = geocodedLocations.indexOf(locationsToGeocode[i]);
-            if (idx >= 0 && geocoded[i] && !geocoded[i].failure) {
-              geocodedLocations[idx] = { ...locationsToGeocode[i], ...geocoded[i] };
+            // Coordinates, or why there are none (issue #110).
+            if (idx >= 0 && geocoded[i]) {
+              geocodedLocations[idx] = applyOutcome(locationsToGeocode[i], geocoded[i]);
             }
           }
         } else if (batchGeocode) {
@@ -198,51 +310,64 @@ router.put('/:id', requireAuth, validateIdParam, validatePersonData, async (req,
 
     const query = `
       UPDATE people
-      SET first_name = $1, last_name = $2, aliases = $3, date_of_birth = $4, category = $5,
-          status = $6, crm_status = $7, case_name = $8, profile_picture_url = $9, notes = $10,
-          osint_data = $11, attachments = $12, connections = $13, locations = $14, custom_fields = $15
-      WHERE id = $16
-      RETURNING *, CONCAT(first_name, ' ', COALESCE(last_name, '')) as full_name;
+      SET first_name = $1, last_name = $2, patronymic = $3, aliases = $4, date_of_birth = $5, category = $6,
+          status = $7, crm_status = $8, case_name = $9, case_id = $10, profile_picture_url = $11, notes = $12,
+          osint_data = $13, attachments = $14, locations = $15, custom_fields = $16
+      WHERE id = $17
+      RETURNING *, CONCAT_WS(' ', first_name, NULLIF(patronymic, ''), NULLIF(last_name, '')) as full_name;
     `;
 
     const values = [
       firstName,
       lastName || null,
+      newPatronymic,
       aliases || [],
       dateOfBirth || null,
       category || null,
       status || null,
       crmStatus || null,
-      caseName || null,
+      personCase.case_name,
+      personCase.case_id,
       profilePictureUrl || null,
       notes || null,
       JSON.stringify(osintData || []),
       JSON.stringify(attachments || []),
-      JSON.stringify(connections || []),
       JSON.stringify(geocodedLocations),
       JSON.stringify(custom_fields || {}),
       personId
     ];
 
-    const result = await pool.query(query, values);
-    const newPerson = result.rows[0];
+    // The update and the connection replace commit together: a failure can't
+    // leave the connections deleted and only half re-added (#112).
+    const reverseAdded = await inTransaction(async (client) => {
+      const { rows } = await client.query(query, values);
+      await syncPersonConnections(rows[0].id, rows[0].project_id, rows[0].case_id, connections, client, canEditProject(req));
+      return addReverseConnections(rows[0].id, connections, canEditProject(req), client);
+    });
+    const newPerson = await fetchPersonById(personId, req);
+    await auditReverseConnections(personId, reverseAdded, req.session?.userId);
 
     // Log audit changes — scalar fields compared directly, JSON fields by serialisation
     const changes = {};
     if (oldPerson.first_name !== firstName) changes.first_name = { oldValue: oldPerson.first_name, newValue: firstName };
     if (oldPerson.last_name !== lastName) changes.last_name = { oldValue: oldPerson.last_name, newValue: lastName };
+    if (oldPerson.patronymic !== newPatronymic) changes.patronymic = { oldValue: oldPerson.patronymic, newValue: newPatronymic };
     if (oldPerson.category !== category) changes.category = { oldValue: oldPerson.category, newValue: category };
     if (oldPerson.status !== status) changes.status = { oldValue: oldPerson.status, newValue: status };
-    if (oldPerson.case_name !== caseName) changes.case_name = { oldValue: oldPerson.case_name, newValue: caseName };
+    if (oldPerson.case_name !== personCase.case_name) changes.case_name = { oldValue: oldPerson.case_name, newValue: personCase.case_name };
+    if (oldPerson.case_id !== personCase.case_id) changes.case_id = { oldValue: oldPerson.case_id, newValue: personCase.case_id };
     if (oldPerson.notes !== (notes || null)) changes.notes = { oldValue: oldPerson.notes, newValue: notes || null };
-    // Store actual before/after JSON for tracked fields (issue #39)
+    // Store actual before/after JSON for tracked fields (issue #39).
+    // connections compares against oldConnections (fetched from relationships
+    // pre-update above), not oldPerson.connections -- that raw column is no
+    // longer authoritative as of issue #83.
     const jsonFieldMap = [
-      ['locations', geocodedLocations],
-      ['connections', connections],
-      ['osint_data', osintData],
+      ['locations', geocodedLocations, oldPerson.locations],
+      ['connections', storedConnections(connections), oldConnections],
+      ['osint_data', osintData, oldPerson.osint_data],
     ];
-    for (const [field, newVal] of jsonFieldMap) {
-      const oldSerialized = JSON.stringify(oldPerson[field] ?? null);
+    for (const [field, newVal, oldVal] of jsonFieldMap) {
+      const oldSerialized = JSON.stringify(oldVal ?? null);
       const newSerialized = JSON.stringify(newVal ?? null);
       if (oldSerialized !== newSerialized) {
         changes[field] = { oldValue: oldSerialized, newValue: newSerialized };
@@ -250,11 +375,12 @@ router.put('/:id', requireAuth, validateIdParam, validatePersonData, async (req,
     }
 
     if (Object.keys(changes).length > 0) {
-      await logAudit('person', personId, 'update', changes);
+      await logAudit('person', personId, 'update', changes, req.session?.userId);
     }
 
     res.json(newPerson);
   } catch (err) {
+    if (err.statusCode) return res.status(err.statusCode).json({ error: err.message });
     console.error('Error updating person:', err.message, err.stack);
     res.status(500).json({ error: 'Failed to update person' });
   }
@@ -270,6 +396,11 @@ router.post('/:id/locations', requireAuth, validateIdParam, async (req, res) => 
   }
 
   try {
+    const existing = await pool.query('SELECT project_id FROM people WHERE id = $1', [personId]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: 'Person not found' });
+    const accessErr = await requireProjectMember(req, existing.rows[0].project_id);
+    if (accessErr) return res.status(403).json({ error: accessErr });
+
     const result = await pool.query(
       `UPDATE people
        SET locations = COALESCE(locations, '[]'::jsonb) || $1::jsonb
@@ -297,6 +428,11 @@ router.put('/:id/locations/:index', requireAuth, validateIdParam, async (req, re
     return res.status(400).json({ error: 'Location object is required' });
   }
   try {
+    const existing = await pool.query('SELECT project_id FROM people WHERE id = $1', [personId]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: 'Person not found' });
+    const accessErr = await requireProjectMember(req, existing.rows[0].project_id);
+    if (accessErr) return res.status(403).json({ error: accessErr });
+
     const result = await pool.query(
       `UPDATE people
        SET locations = jsonb_set(locations, ARRAY[$1::text], $2::jsonb, false)
@@ -320,6 +456,11 @@ router.delete('/:id/locations/:index', requireAuth, validateIdParam, async (req,
     return res.status(400).json({ error: 'Invalid location index' });
   }
   try {
+    const existing = await pool.query('SELECT project_id FROM people WHERE id = $1', [personId]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: 'Person not found' });
+    const accessErr = await requireProjectMember(req, existing.rows[0].project_id);
+    if (accessErr) return res.status(403).json({ error: accessErr });
+
     const result = await pool.query(
       `UPDATE people
        SET locations = locations - $1
@@ -335,6 +476,43 @@ router.delete('/:id/locations/:index', requireAuth, validateIdParam, async (req,
   }
 });
 
+// POST /:id/osint — add OSINT data found by an integrated tool (issue #96)
+//
+// Appends on the server rather than having the browser PUT the whole person
+// back: a full update from a modal that only knows part of the record is how
+// fields got wiped in the past. A value the person already has (same type and
+// value) gets the new finding added to its sources instead of a second entry
+// (utils/osintFindings.js). Each new entry keeps where it came from and starts
+// unverified.
+router.post('/:id/osint', requireAuth, validateIdParam, validate(PersonOsintAppendSchema), async (req, res) => {
+  const { entries } = req.body;
+  try {
+    const existing = await pool.query('SELECT project_id, osint_data FROM people WHERE id = $1', [req.params.id]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: 'Person not found' });
+    const accessErr = await requireProjectMember(req, existing.rows[0].project_id);
+    if (accessErr) return res.status(403).json({ error: accessErr });
+
+    const current = Array.isArray(existing.rows[0].osint_data) ? existing.rows[0].osint_data : [];
+    const { osintData, added, updated, unchanged } = mergeOsintFindings(current, entries, req.session?.userId || null);
+
+    if (added || updated) {
+      await pool.query('UPDATE people SET osint_data = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
+        [JSON.stringify(osintData), req.params.id]);
+      await logAudit('person', req.params.id, 'update', {
+        osint_data: {
+          oldValue: `${current.length} entries`,
+          newValue: `+${added} new, ${updated} with new findings, from ${entries[0].source?.tool_name || 'import'}`,
+        },
+      }, req.session?.userId);
+    }
+    // skipped: kept for older clients; same as unchanged.
+    res.json({ added, updated, unchanged, skipped: unchanged, osint_data: osintData });
+  } catch (err) {
+    console.error('Error adding OSINT data:', err.message);
+    res.status(500).json({ error: 'Failed to add OSINT data' });
+  }
+});
+
 // DELETE /:id — delete person
 router.delete('/:id', requireAuth, validateIdParam, async (req, res) => {
   const personId = req.params.id;
@@ -344,12 +522,20 @@ router.delete('/:id', requireAuth, validateIdParam, async (req, res) => {
     const oldResult = await pool.query('SELECT * FROM people WHERE id = $1', [personId]);
     if (oldResult.rows.length === 0) return res.status(404).json({ error: 'Person not found' });
 
-    const result = await pool.query('DELETE FROM people WHERE id = $1 RETURNING *;', [personId]);
+    const accessErr = await requireProjectMember(req, oldResult.rows[0].project_id);
+    if (accessErr) return res.status(403).json({ error: accessErr });
+
+    // Connections and other links without a foreign key go in the same
+    // transaction (#112), so none are left pointing at nobody.
+    const result = await inTransaction(async (client) => {
+      await removeEntityLinks(client, 'person', personId);
+      return client.query('DELETE FROM people WHERE id = $1 RETURNING *;', [personId]);
+    });
     if (result.rows.length === 0) return res.status(404).json({ error: 'Person not found' });
 
     await logAudit('person', personId, 'delete', {
       record: { oldValue: JSON.stringify(result.rows[0]), newValue: null }
-    });
+    }, req.session?.userId);
 
     res.status(200).json({ message: 'Person deleted successfully', deletedPerson: result.rows[0] });
   } catch (err) {

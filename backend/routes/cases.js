@@ -3,10 +3,21 @@ const router = express.Router();
 const { pool } = require('../config/database');
 const { requireAuth } = require('../middleware/auth');
 const { validateIdParam } = require('../middleware/validation');
+const { validate, CaseCreateSchema, CaseUpdateSchema } = require('../middleware/schemas');
+const { apiLimiter } = require('../middleware/rateLimiters');
+const { applyProjectScope, requireProjectMember } = require('../utils/projectAccess');
 
+
+router.use(apiLimiter);
 router.get('/', requireAuth, async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM cases ORDER BY case_name ASC');
+    const where = [];
+    const params = [];
+    const scopeErr = await applyProjectScope(req, 'cases', where, params);
+    if (scopeErr) return res.status(403).json({ error: scopeErr });
+    const whereClause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+
+    const result = await pool.query(`SELECT * FROM cases ${whereClause} ORDER BY case_name ASC, id ASC`, params);
     res.json(result.rows);
   } catch (err) {
     console.error('Error fetching cases:', err);
@@ -14,14 +25,16 @@ router.get('/', requireAuth, async (req, res) => {
   }
 });
 
-router.post('/', requireAuth, async (req, res) => {
-  const { case_name, description } = req.body;
-  if (!case_name) return res.status(400).json({ error: 'Case name is required' });
+router.post('/', requireAuth, validate(CaseCreateSchema), async (req, res) => {
+  const { case_name, description, project_id } = req.body;
 
   try {
+    const accessErr = await requireProjectMember(req, project_id);
+    if (accessErr) return res.status(403).json({ error: accessErr });
+
     const result = await pool.query(
-      'INSERT INTO cases (case_name, description) VALUES ($1, $2) RETURNING *',
-      [case_name, description || null]
+      'INSERT INTO cases (case_name, description, project_id) VALUES ($1, $2, $3) RETURNING *',
+      [case_name, description || null, project_id]
     );
     res.status(201).json(result.rows[0]);
   } catch (err) {
@@ -33,18 +46,23 @@ router.post('/', requireAuth, async (req, res) => {
   }
 });
 
-router.put('/:id', requireAuth, validateIdParam, async (req, res) => {
+router.put('/:id', requireAuth, validateIdParam, validate(CaseUpdateSchema), async (req, res) => {
   const caseId = req.params.id;
   const { case_name, description, status } = req.body;
 
-  if (!case_name) return res.status(400).json({ error: 'Case name is required for update' });
-
   try {
+    const existing = await pool.query('SELECT project_id FROM cases WHERE id = $1', [caseId]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: 'Case not found' });
+    const accessErr = await requireProjectMember(req, existing.rows[0].project_id);
+    if (accessErr) return res.status(403).json({ error: accessErr });
+
     const result = await pool.query(
       'UPDATE cases SET case_name = $1, description = $2, status = $3 WHERE id = $4 RETURNING *',
       [case_name, description || null, status || 'open', caseId]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Case not found' });
+    // People show the case by name; keep it current on a rename (issue #118).
+    await pool.query('UPDATE people SET case_name = $1 WHERE case_id = $2', [result.rows[0].case_name, caseId]);
     res.json(result.rows[0]);
   } catch (err) {
     console.error('Error updating case:', err);
@@ -56,6 +74,11 @@ router.delete('/:id', requireAuth, validateIdParam, async (req, res) => {
   const caseId = req.params.id;
 
   try {
+    const existing = await pool.query('SELECT project_id FROM cases WHERE id = $1', [caseId]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: 'Case not found' });
+    const accessErr = await requireProjectMember(req, existing.rows[0].project_id);
+    if (accessErr) return res.status(403).json({ error: accessErr });
+
     const result = await pool.query('DELETE FROM cases WHERE id = $1 RETURNING *', [caseId]);
     if (result.rows.length === 0) return res.status(404).json({ error: 'Case not found' });
     res.json({ message: 'Case deleted successfully' });

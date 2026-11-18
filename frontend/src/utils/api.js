@@ -1,7 +1,13 @@
 // File: frontend/src/utils/api.js
-const API_BASE_URL = process.env.REACT_APP_API_URL || '/api';
+const API_BASE_URL = import.meta.env.VITE_API_URL || '/api';
 
 const DEFAULT_TIMEOUT_MS = 30000;
+
+// Fired when the server answers 401 to a signed-in request: the session
+// ended on the server (signed out elsewhere, revoked by an admin, or ended at
+// the identity provider, issue #105). AuthContext takes it from there.
+// /auth/ endpoints are left out: there 401 also means "wrong password".
+export const SESSION_ENDED_EVENT = 'ghost:session-ended';
 
 // Generic fetch wrapper with error handling and timeout
 const fetchAPI = async (endpoint, options = {}) => {
@@ -22,9 +28,18 @@ const fetchAPI = async (endpoint, options = {}) => {
 
     clearTimeout(timeoutId);
 
+    if (response.status === 401 && !endpoint.startsWith('/auth/')) {
+      window.dispatchEvent(new Event(SESSION_ENDED_EVENT));
+    }
+
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({}));
-      throw new Error(errorData.error || `HTTP error! status: ${response.status}`);
+      const error = new Error(errorData.error || `HTTP error! status: ${response.status}`);
+      // Callers need the status to tell "no permission" (403) apart from
+      // "backend down" — treating them the same locked non-admin users out
+      // with a false "System Offline" (issue #58)
+      error.status = response.status;
+      throw error;
     }
 
     if (responseType === 'blob') {
@@ -50,7 +65,7 @@ const fetchAPI = async (endpoint, options = {}) => {
     if (error.name === 'AbortError') {
       const msg = `Request timed out (${endpoint})`;
       console.error(msg);
-      throw new Error(msg);
+      throw new Error(msg, { cause: error });
     }
     console.error(`API Error (${endpoint}):`, error);
     throw error;
@@ -59,9 +74,19 @@ const fetchAPI = async (endpoint, options = {}) => {
 
 // People API
 export const peopleAPI = {
-  getAll: ({ limit = 100, offset = 0 } = {}) =>
-    fetchAPI(`/people?limit=${limit}&offset=${offset}`, { returnMeta: true }),
-  
+  getAll: ({ limit = 100, offset = 0, ...rest } = {}) =>
+    fetchAPI(`/people${buildQuery({ limit, offset, ...rest })}`, { returnMeta: true }),
+
+  getById: (id) => fetchAPI(`/people/${id}`),
+
+  // Appends OSINT data entries server-side (issue #96); duplicates are skipped.
+  addOsint: (id, entries) => fetchAPI(`/people/${id}/osint`, { method: 'POST', body: JSON.stringify({ entries }) }),
+  // People whose name, patronymic or alias contains the text, in a project.
+  search: (text, projectId, limit = 10) => fetchAPI(`/search/advanced?${new URLSearchParams([
+    ['searchText', text], ['searchIn[]', 'name'], ['searchIn[]', 'aliases'], ['limit', String(limit)],
+    ...(projectId ? [['project_id', String(projectId)]] : []),
+  ])}`),
+
   create: (personData) => fetchAPI('/people', {
     method: 'POST',
     body: JSON.stringify(personData),
@@ -79,7 +104,7 @@ export const peopleAPI = {
 
 // Businesses API
 export const businessesAPI = {
-  getAll: () => fetchAPI('/businesses'),
+  getAll: (params = {}) => fetchAPI(`/businesses${buildQuery(params)}`),
   
   create: (businessData) => fetchAPI('/businesses', {
     method: 'POST',
@@ -98,7 +123,23 @@ export const businessesAPI = {
 
 // Tools API
 export const toolsAPI = {
-  getAll: () => fetchAPI('/tools'),
+  // Bulk import: one request rather than one per row, so a few hundred tools
+  // don't trip the rate limiter.
+  bulkImport: (payload) => fetchAPI('/tools/bulk-import', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  }),
+  // params: { project_id, all } — all=true (admins) lists every tool.
+  getAll: (params = {}) => fetchAPI(`/tools${buildQuery(params)}`),
+  // Integrated tools (issue #96). Keys are write-only: there is no getter.
+  setKey: (id, scope, secret) => fetchAPI(`/tools/${id}/credentials`, { method: 'PUT', body: JSON.stringify({ scope, secret }) }),
+  removeKey: (id, scope) => fetchAPI(`/tools/${id}/credentials?scope=${scope}`, { method: 'DELETE' }),
+  run: (id, payload) => fetchAPI(`/tools/${id}/run`, { method: 'POST', body: JSON.stringify(payload), timeout: 90000 }),
+  test: (id) => fetchAPI(`/tools/${id}/test`, { method: 'POST', timeout: 90000 }),
+  exportFile: (payload) => fetchAPI('/tools/export', { method: 'POST', body: JSON.stringify(payload) }),
+  importFile: (payload) => fetchAPI('/tools/import', { method: 'POST', body: JSON.stringify(payload), timeout: 120000 }),
+  getSettings: () => fetchAPI('/settings/tools'),
+  updateSettings: (payload) => fetchAPI('/settings/tools', { method: 'PUT', body: JSON.stringify(payload) }),
   
   create: (toolData) => fetchAPI('/tools', {
     method: 'POST',
@@ -117,7 +158,7 @@ export const toolsAPI = {
 
 // Todos API
 export const todosAPI = {
-  getAll: () => fetchAPI('/todos'),
+  getAll: (params = {}) => fetchAPI(`/todos${buildQuery(params)}`),
   
   create: (todoData) => fetchAPI('/todos', {
     method: 'POST',
@@ -136,7 +177,7 @@ export const todosAPI = {
 
 // Cases API
 export const casesAPI = {
-  getAll: () => fetchAPI('/cases'),
+  getAll: (params = {}) => fetchAPI(`/cases${buildQuery(params)}`),
   
   create: (caseData) => fetchAPI('/cases', {
     method: 'POST',
@@ -149,6 +190,47 @@ export const casesAPI = {
   }),
   
   delete: (id) => fetchAPI(`/cases/${id}`, {
+    method: 'DELETE',
+  }),
+};
+
+// Projects API (issue #83) — the hard isolation boundary; cases nest inside a project.
+export const projectsAPI = {
+  getAll: () => fetchAPI('/projects'),
+
+  create: (projectData) => fetchAPI('/projects', {
+    method: 'POST',
+    body: JSON.stringify(projectData),
+  }),
+
+  update: (id, projectData) => fetchAPI(`/projects/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify(projectData),
+  }),
+
+  // Per-entity row counts for the delete-confirmation dialog (issue #88).
+  getStats: (id) => fetchAPI(`/projects/${id}/stats`),
+
+  // Cascade delete (issue #88). When the project holds data the backend
+  // requires confirmName to equal the project's exact name.
+  delete: (id, confirmName) => fetchAPI(`/projects/${id}`, {
+    method: 'DELETE',
+    body: JSON.stringify(confirmName != null ? { confirm_name: confirmName } : {}),
+  }),
+};
+
+// Project Members API (issue #84)
+export const projectMembersAPI = {
+  getAll: (projectId) => fetchAPI(`/projects/${projectId}/members`),
+  add: (projectId, data) => fetchAPI(`/projects/${projectId}/members`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  }),
+  updateRole: (projectId, userId, project_role) => fetchAPI(`/projects/${projectId}/members/${userId}`, {
+    method: 'PUT',
+    body: JSON.stringify({ project_role }),
+  }),
+  remove: (projectId, userId) => fetchAPI(`/projects/${projectId}/members/${userId}`, {
     method: 'DELETE',
   }),
 };
@@ -173,6 +255,50 @@ export const customFieldsAPI = {
 };
 
 // Model Options API
+// Running version + whether a newer release exists. The check runs on the
+// server; the browser never contacts GitHub.
+export const versionAPI = {
+  get: () => fetchAPI('/version'),
+};
+
+export const updateSettingsAPI = {
+  get: () => fetchAPI('/settings/updates'),
+  update: (payload) => fetchAPI('/settings/updates', {
+    method: 'PUT',
+    body: JSON.stringify(payload),
+  }),
+};
+
+// Archived-project retention policy (issue #88). retentionDays: 0 = never.
+// Server-side global app settings (issue #91): branding + system-wide
+// defaults for language/theme. GET needs no auth — the login screen and the
+// first app paint need it before we know who's signed in.
+export const brandingAPI = {
+  get: () => fetchAPI('/settings/branding'),
+  update: (data) => fetchAPI('/settings/branding', {
+    method: 'PUT',
+    body: JSON.stringify(data),
+  }),
+};
+
+export const projectRetentionAPI = {
+  get: () => fetchAPI('/settings/project-retention'),
+  update: (retentionDays) => fetchAPI('/settings/project-retention', {
+    method: 'PUT',
+    body: JSON.stringify({ retentionDays }),
+  }),
+};
+
+// Geocoding provider config (issue #62). The API key is write-only server
+// side — get() reports only whether one is stored, never its value.
+export const geocodingSettingsAPI = {
+  get: () => fetchAPI('/settings/geocoding'),
+  update: (payload) => fetchAPI('/settings/geocoding', {
+    method: 'PUT',
+    body: JSON.stringify(payload),
+  }),
+};
+
 export const modelOptionsAPI = {
   getAll: () => fetchAPI('/settings/model-options'),
   
@@ -189,14 +315,6 @@ export const modelOptionsAPI = {
   delete: (id) => fetchAPI(`/settings/model-options/${id}`, {
     method: 'DELETE',
   }),
-};
-
-// Audit Log API
-export const auditAPI = {
-  getAll: (params = {}) => {
-    const queryParams = new URLSearchParams(params).toString();
-    return fetchAPI(`/audit-logs${queryParams ? '?' + queryParams : ''}`);
-  },
 };
 
 // Export/Import API - Fixed export function
@@ -238,7 +356,7 @@ export const exportAPI = {
 };
 
 export const importAPI = {
-  import: (data) => fetchAPI('/import', {
+  import: (data, projectId) => fetchAPI(`/import${buildQuery({ project_id: projectId })}`, {
     method: 'POST',
     body: JSON.stringify(data),
   }),
@@ -268,31 +386,22 @@ export const uploadLogo = async (file) => {
   }
 };
 
-// Locations API
-export const locationsAPI = {
-  getAll: () => fetchAPI('/locations'),
+// Geocoding (issue #110): one address, or every address without a position.
+// lookup → { success: true, result: { lat, lng, confidence, displayName, provider } }
+//        | { success: false, reason, message, best_match }
+export const geocodingAPI = {
+  lookup: (address) => fetchAPI('/geocode/address', { method: 'POST', body: JSON.stringify({ address }) }),
+  // → { summary: { total, geocoded, cached, failed }, failures: [{ person_id, person_name, address, reason, message, best_match }] }
+  batch: (locations) => fetchAPI('/geocode/batch-enhanced', {
+    method: 'POST',
+    body: JSON.stringify({ locations, minConfidence: 30, maxConcurrent: 3 }),
+    timeout: 10 * 60 * 1000,
+  }),
 };
 
-// Advanced Search API
-export const searchAPI = {
-  advanced: (params) => {
-    const queryParams = new URLSearchParams();
-    
-    // Convert complex search params to query string
-    Object.entries(params).forEach(([key, value]) => {
-      if (Array.isArray(value)) {
-        value.forEach(v => queryParams.append(`${key}[]`, v));
-      } else if (typeof value === 'object') {
-        Object.entries(value).forEach(([subKey, subValue]) => {
-          queryParams.append(`${key}[${subKey}]`, subValue);
-        });
-      } else if (value !== '' && value !== null) {
-        queryParams.append(key, value);
-      }
-    });
-    
-    return fetchAPI(`/search/advanced?${queryParams.toString()}`);
-  }
+// Locations API
+export const locationsAPI = {
+  getAll: (params = {}) => fetchAPI(`/locations${buildQuery(params)}`),
 };
 
 // Travel History API
@@ -318,7 +427,7 @@ export const travelHistoryAPI = {
 
 // Business API
 export const businessAPI = {
-  getAll: () => fetchAPI('/businesses'),
+  getAll: (params = {}) => fetchAPI(`/businesses${buildQuery(params)}`),
   
   getById: (id) => fetchAPI(`/businesses/${id}`),
   
@@ -372,14 +481,15 @@ export const wirelessNetworksAPI = {
     method: 'DELETE',
   }),
 
-  bulkDelete: (ids) => fetchAPI('/wireless-networks/bulk-delete', {
+  bulkDelete: (ids, projectId) => fetchAPI('/wireless-networks/bulk-delete', {
     method: 'POST',
-    body: JSON.stringify({ ids }),
+    body: JSON.stringify({ ids, project_id: projectId }),
   }),
 
-  importKML: async (file) => {
+  importKML: async (file, projectId) => {
     const formData = new FormData();
     formData.append('kmlFile', file);
+    if (projectId) formData.append('project_id', projectId);
 
     const response = await fetch(`${API_BASE_URL}/wireless-networks/import-kml`, {
       method: 'POST',
@@ -395,7 +505,7 @@ export const wirelessNetworksAPI = {
     return response.json();
   },
 
-  getStats: () => fetchAPI('/wireless-networks/stats'),
+  getStats: (params = {}) => fetchAPI(`/wireless-networks/stats${buildQuery(params)}`),
 
   getNearby: (latitude, longitude, radius = 0.5) =>
     fetchAPI(`/wireless-networks/nearby?latitude=${latitude}&longitude=${longitude}&radius=${radius}`),
@@ -414,4 +524,190 @@ export const wirelessNetworksAPI = {
   }),
 };
 
+// Helper to build a query string from a params object (skips empty values)
+const buildQuery = (params = {}) => {
+  const qp = new URLSearchParams();
+  Object.entries(params).forEach(([key, value]) => {
+    if (value !== null && value !== undefined && value !== '') qp.append(key, value);
+  });
+  const s = qp.toString();
+  return s ? `?${s}` : '';
+};
+
+// Properties API (transaction tracking — issue #43)
+export const propertiesAPI = {
+  getAll: (params = {}) => fetchAPI(`/properties${buildQuery(params)}`),
+  getById: (id) => fetchAPI(`/properties/${id}`),
+  create: (data) => fetchAPI('/properties', { method: 'POST', body: JSON.stringify(data) }),
+  update: (id, data) => fetchAPI(`/properties/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  remove: (id) => fetchAPI(`/properties/${id}`, { method: 'DELETE' }),
+  getTransactions: (id) => fetchAPI(`/properties/${id}/transactions`),
+  getLedger: (id, params = {}) => fetchAPI(`/properties/${id}/ledger${buildQuery(params)}`),
+};
+
+// Assets API
+export const assetsAPI = {
+  getAll: (params = {}) => fetchAPI(`/assets${buildQuery(params)}`),
+  getById: (id) => fetchAPI(`/assets/${id}`),
+  create: (data) => fetchAPI('/assets', { method: 'POST', body: JSON.stringify(data) }),
+  update: (id, data) => fetchAPI(`/assets/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  remove: (id) => fetchAPI(`/assets/${id}`, { method: 'DELETE' }),
+  getByPerson: (personId) => fetchAPI(`/people/${personId}/assets`),
+};
+
+// Crypto Wallets API (issue #82)
+export const cryptoWalletsAPI = {
+  getAll: (params = {}) => fetchAPI(`/crypto-wallets${buildQuery(params)}`),
+  getById: (id) => fetchAPI(`/crypto-wallets/${id}`),
+  create: (data) => fetchAPI('/crypto-wallets', { method: 'POST', body: JSON.stringify(data) }),
+  update: (id, data) => fetchAPI(`/crypto-wallets/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  remove: (id) => fetchAPI(`/crypto-wallets/${id}`, { method: 'DELETE' }),
+};
+
+// Files API (issue #97). Uploads go through XMLHttpRequest rather than
+// fetchAPI: fetch can't report upload progress, and fetchAPI's 30 s timeout
+// would cut off a large upload.
+// Sections switched off for the whole instance.
+export const modulesAPI = {
+  get: () => fetchAPI('/settings/modules'),
+  update: (disabled) => fetchAPI('/settings/modules', { method: 'PUT', body: JSON.stringify({ disabled }) }),
+};
+
+// Saved integration records on people (issue #96).
+export const osintRecordsAPI = {
+  // params: { person_id?, project_id?, q?, integration_id?, limit?, offset? } → { data, meta }
+  list: (params = {}) => fetchAPI(`/records${buildQuery(params)}`),
+  // records: [{ data, record_source?, occurrences?, source? }]
+  add: (personId, records) => fetchAPI('/records', { method: 'POST', body: JSON.stringify({ person_id: personId, records }) }),
+  remove: (id) => fetchAPI(`/records/${id}`, { method: 'DELETE' }),
+};
+
+export const filesAPI = {
+  getAll: (params = {}) => fetchAPI(`/files${buildQuery(params)}`),
+  update: (id, data) => fetchAPI(`/files/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  remove: (id) => fetchAPI(`/files/${id}`, { method: 'DELETE' }),
+
+  // fields: { project_id?, person_id?, description? }. onProgress gets 0..1.
+  upload: (file, fields = {}, onProgress) => new Promise((resolve, reject) => {
+    const form = new FormData();
+    Object.entries(fields).forEach(([k, v]) => {
+      if (v !== null && v !== undefined && v !== '') form.append(k, v);
+    });
+    form.append('file', file);
+
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `${API_BASE_URL}/files`);
+    xhr.withCredentials = true;
+    if (onProgress) {
+      xhr.upload.onprogress = (e) => { if (e.lengthComputable) onProgress(e.loaded / e.total); };
+    }
+    xhr.onload = () => {
+      let body = {};
+      try { body = JSON.parse(xhr.responseText || '{}'); } catch { /* non-JSON error page */ }
+      if (xhr.status >= 200 && xhr.status < 300) return resolve(body);
+      const error = new Error(body.error || `HTTP error! status: ${xhr.status}`);
+      error.status = xhr.status;
+      error.limitBytes = body.limit_bytes;
+      reject(error);
+    };
+    xhr.onerror = () => reject(new Error('Network error'));
+    xhr.send(form);
+  }),
+
+  // The file's bytes as a Blob. preview: true is logged as a view rather than
+  // a download. Downloads also go through here (not a plain link) so they
+  // work behind the dev-server proxy, which doesn't forward page navigations.
+  fetchContent: async (id, { preview = false } = {}) => {
+    const response = await fetchAPI(`/files/${id}/content${preview ? '?preview=1' : ''}`, {
+      responseType: 'blob',
+      timeout: 5 * 60 * 1000,
+    });
+    return response.blob();
+  },
+};
+
+// Saves a Blob to the user's computer under the given name.
+export const saveBlob = (blob, filename) => {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename || 'file';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+};
+
+// Integration manifests behind integrated tools (issue #96).
+export const integrationsAPI = {
+  getAll: () => fetchAPI('/integrations'),
+  get: (id) => fetchAPI(`/integrations/${encodeURIComponent(id)}`),
+  install: (manifest, replace = false) => fetchAPI('/integrations', { method: 'POST', body: JSON.stringify({ manifest, replace }) }),
+  remove: (id) => fetchAPI(`/integrations/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  // Integration builder: one test call for an uninstalled draft, and a
+  // mapping preview that makes no outbound request.
+  draftTest: (payload) => fetchAPI('/integrations/draft/test', { method: 'POST', body: JSON.stringify(payload), timeout: 90000 }),
+  draftMap: (payload) => fetchAPI('/integrations/draft/map', { method: 'POST', body: JSON.stringify(payload) }),
+};
+
+// Relationships API (issue #83's write-of-record table; issue #82's wallet
+// links are the first frontend consumer to read/write it directly rather
+// than through the person/business JSONB sync path).
+export const relationshipsAPI = {
+  getAll: (params = {}) => fetchAPI(`/relationships${buildQuery(params)}`),
+  create: (data) => fetchAPI('/relationships', { method: 'POST', body: JSON.stringify(data) }),
+  update: (id, data) => fetchAPI(`/relationships/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  remove: (id) => fetchAPI(`/relationships/${id}`, { method: 'DELETE' }),
+};
+
+// The project graph, or the graph around one entity (graph plan):
+// { project_id, include, identifiers } or { focus: 'person:12', depth }.
+export const graphAPI = {
+  get: (params = {}) => fetchAPI(`/graph${buildQuery(params)}`),
+  path: (params = {}) => fetchAPI(`/graph/path${buildQuery(params)}`),
+  // The caller's saved layout of a view ("project" or "focus:<type>:<id>").
+  getLayout: (projectId, view) => fetchAPI(`/graph/layouts${buildQuery({ project_id: projectId, view })}`),
+  saveLayout: (projectId, view, positions) => fetchAPI('/graph/layouts', {
+    method: 'PUT', body: JSON.stringify({ project_id: projectId, view, positions }),
+  }),
+  deleteLayout: (projectId, view) => fetchAPI(`/graph/layouts${buildQuery({ project_id: projectId, view })}`, { method: 'DELETE' }),
+};
+
+// Transactions API
+export const transactionsAPI = {
+  getAll: (params = {}) => fetchAPI(`/transactions${buildQuery(params)}`),
+  getById: (id) => fetchAPI(`/transactions/${id}`),
+  create: (data) => fetchAPI('/transactions', { method: 'POST', body: JSON.stringify(data) }),
+  update: (id, data) => fetchAPI(`/transactions/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  remove: (id) => fetchAPI(`/transactions/${id}`, { method: 'DELETE' }),
+  getByPerson: (personId) => fetchAPI(`/people/${personId}/transactions`),
+  getByBusiness: (businessId) => fetchAPI(`/businesses/${businessId}/transactions`),
+  getByProperty: (propertyId) => fetchAPI(`/properties/${propertyId}/transactions`),
+};
+
+// Entity ledger + venue analytics API
+export const ledgerAPI = {
+  get: (entityType, id, params = {}) => fetchAPI(`/${entityType}/${id}/ledger${buildQuery(params)}`),
+  venueStats: (businessId) => fetchAPI(`/businesses/${businessId}/venue-stats`),
+};
+
 export { API_BASE_URL };
+// Scratchpad API — the caller's private notepad (not project-scoped)
+export const scratchpadAPI = {
+  get: () => fetchAPI('/scratchpad'),
+  addEntry: (content, source_label = null) => fetchAPI('/scratchpad/entries', {
+    method: 'POST',
+    body: JSON.stringify({ content, source_label }),
+  }),
+  updateEntry: (id, content) => fetchAPI(`/scratchpad/entries/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify({ content }),
+  }),
+  // keepalive lets a delete still go out while the page is closing
+  deleteEntry: (id, keepalive = false) => fetchAPI(`/scratchpad/entries/${id}`, { method: 'DELETE', keepalive }),
+  clear: (upToId, keepalive = false) => fetchAPI(`/scratchpad/entries${buildQuery({ up_to_id: upToId })}`, { method: 'DELETE', keepalive }),
+  updateSettings: (settings) => fetchAPI('/scratchpad/settings', {
+    method: 'PUT',
+    body: JSON.stringify(settings),
+  }),
+};

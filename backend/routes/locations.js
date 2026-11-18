@@ -2,7 +2,11 @@ const express = require('express');
 const router = express.Router();
 const { pool } = require('../config/database');
 const { requireAuth } = require('../middleware/auth');
+const { apiLimiter } = require('../middleware/rateLimiters');
+const { applyProjectScope } = require('../utils/projectAccess');
 
+
+router.use(apiLimiter);
 // Get locations with filtering and pagination
 router.get('/', requireAuth, async (req, res) => {
   try {
@@ -11,12 +15,23 @@ router.get('/', requireAuth, async (req, res) => {
       offset = 0,
       bbox,
       confidence = 30,
-      includeUngeocoded = false
+      includeUngeocoded = false,
+      case_id
     } = req.query;
 
     let where = `WHERE p.locations IS NOT NULL AND p.locations != '[]'::jsonb`;
     const params = [];
-    let paramIndex = 1;
+
+    const scopeWhere = [];
+    const scopeErr = await applyProjectScope(req, 'p', scopeWhere, params);
+    if (scopeErr) return res.status(403).json({ error: scopeErr });
+    if (scopeWhere.length) where += ` AND ${scopeWhere.join(' AND ')}`;
+    let paramIndex = params.length + 1;
+
+    if (case_id) {
+      where += ` AND p.case_id = $${paramIndex++}`;
+      params.push(parseInt(case_id, 10));
+    }
 
     if (bbox) {
       const [minLng, minLat, maxLng, maxLat] = bbox.split(',').map(Number);
@@ -50,7 +65,7 @@ router.get('/', requireAuth, async (req, res) => {
         p.updated_at
       FROM people p
       ${where}
-      ORDER BY p.updated_at DESC
+      ORDER BY p.updated_at DESC, p.id DESC
       LIMIT $${paramIndex++} OFFSET $${paramIndex++}
     `;
     params.push(parseInt(limit), parseInt(offset));

@@ -1,14 +1,34 @@
-// Mock browser dependencies not available in Jest/Node
-jest.mock('file-saver', () => ({ saveAs: jest.fn() }));
-jest.mock('docx', () => ({
-  Document: jest.fn(),
-  Packer: { toBlob: jest.fn().mockResolvedValue(new Blob()) },
-  Paragraph: jest.fn(),
+// Mock browser dependencies the report code pulls in (vi.mock is hoisted).
+import { vi } from 'vitest';
+vi.mock('file-saver', () => ({ saveAs: vi.fn() }));
+vi.mock('docx', () => ({
+  Document: vi.fn(),
+  Packer: { toBlob: vi.fn().mockResolvedValue(new Blob()) },
+  Paragraph: vi.fn(),
   HeadingLevel: { TITLE: 'TITLE', HEADING_1: 'H1', HEADING_2: 'H2' },
   AlignmentType: { CENTER: 'center' },
 }));
 
-import { getFullName, formatDate, formatDateTime, generateMarkdown } from './reportGenerators';
+import i18n from 'i18next';
+import en from '../locales/en/translation.json';
+import ru from '../locales/ru/translation.json';
+import { Paragraph } from 'docx';
+import {
+  getFullName, formatDate, formatDateTime, generateMarkdown, subjectsOf,
+  REPORT_TYPE_PRESETS, REPORT_SECTIONS, matchesPreset, resolveOptions, p,
+} from './reportGenerators';
+
+// Report output is generated through i18n now (issue #63), so the suite runs
+// against the real catalog rather than hardcoded expectations.
+beforeAll(() =>
+  i18n.init({
+    resources: { en: { translation: en }, ru: { translation: ru } },
+    lng: 'en',
+    fallbackLng: 'en',
+    interpolation: { escapeValue: false },
+  })
+);
+afterEach(() => i18n.changeLanguage('en'));
 
 // ── getFullName ────────────────────────────────────────────────────────────
 
@@ -187,5 +207,214 @@ describe('generateMarkdown', () => {
     expect(md).toContain('## INVESTIGATION TASKS');
     expect(md).toContain('Open: 1');
     expect(md).toContain('Completed: 1');
+  });
+});
+
+// ── subjectsOf / person-profile scoping (issue #63) ─────────────────────────
+
+describe('subjectsOf', () => {
+  const alice = { id: 1, first_name: 'Alice', last_name: 'Smith', connections: [] };
+  const bob = { id: 2, first_name: 'Bob', last_name: 'Jones', connections: [] };
+  const roster = [alice, bob];
+
+  test('narrows to the selected person for a person-profile report', () => {
+    expect(subjectsOf(roster, { reportType: 'person-profile' }, alice)).toEqual([alice]);
+  });
+
+  test('returns the whole roster for other report types', () => {
+    expect(subjectsOf(roster, { reportType: 'comprehensive' }, alice)).toEqual(roster);
+  });
+
+  test('returns the whole roster when there is no selected person', () => {
+    expect(subjectsOf(roster, { reportType: 'person-profile' }, null)).toEqual(roster);
+  });
+});
+
+describe('generateMarkdown — person-profile scoping', () => {
+  const alice = {
+    id: 1, first_name: 'Alice', last_name: 'Smith', category: 'POI', status: 'Active',
+    case_name: 'Case A', connections: [{ person_id: 2, type: 'associate', note: 'met 2019' }],
+  };
+  const bob = {
+    id: 2, first_name: 'Bob', last_name: 'Jones', category: 'Witness', status: 'Open',
+    case_name: 'Case A', connections: [],
+  };
+  const data = { ...BASE_DATA, people: [alice, bob], selectedPerson: alice };
+  const options = { ...BASE_OPTIONS, reportType: 'person-profile' };
+
+  test('profiles only the subject, not everyone in their case', () => {
+    const md = generateMarkdown(data, options);
+    expect(md).toContain('Alice Smith');
+    expect(md).not.toContain('#### 2. Bob Jones');
+  });
+
+  test('still resolves connection targets against the full roster', () => {
+    const md = generateMarkdown(data, options);
+    expect(md).toContain('| Alice Smith | Bob Jones | associate | met 2019 |');
+  });
+
+  test('counts only the subject in summary statistics', () => {
+    expect(generateMarkdown(data, options)).toContain('| People | 1 |');
+  });
+
+  test('a comprehensive report over the same data still covers everyone', () => {
+    const md = generateMarkdown(data, { ...BASE_OPTIONS, reportType: 'comprehensive' });
+    expect(md).toContain('#### 2. Bob Jones');
+    expect(md).toContain('| People | 2 |');
+  });
+});
+
+// ── Localised output (issue #63) ───────────────────────────────────────────
+
+describe('report language', () => {
+  const data = {
+    ...BASE_DATA,
+    people: [{ id: 1, first_name: 'Иван', last_name: 'Сидоров', category: 'Suspect', connections: [] }],
+  };
+
+  test('headings come from the catalog, not hardcoded English', () => {
+    const md = generateMarkdown(data, BASE_OPTIONS);
+    expect(md).toContain(`# ${en.report.investigationReport}`);
+    expect(md).toContain(`## ${en.report.summaryStatistics}`);
+    expect(md).toContain(en.report.confidentialityNotice);
+  });
+
+  test('switching language changes the generated report', async () => {
+    const before = generateMarkdown(data, BASE_OPTIONS);
+    await i18n.changeLanguage('ru');
+    const after = generateMarkdown(data, BASE_OPTIONS);
+    expect(after).not.toBe(before);
+    // The Russian catalog may be partially translated; whatever it does have
+    // for the report title must be what the report actually uses.
+    expect(after).toContain(`# ${i18n.t('report.investigationReport')}`);
+  });
+
+  test('interpolated counts survive translation', () => {
+    const md = generateMarkdown(
+      { ...data, selectedCase: { case_name: 'Operation X', status: 'Active' } },
+      { ...BASE_OPTIONS, reportType: 'comprehensive' }
+    );
+    expect(md).toContain('Operation X');
+    expect(md).not.toContain('{{');
+  });
+});
+
+// ── Section selection is honoured verbatim (issue #77) ─────────────────────
+
+describe('report sections are what the user selected', () => {
+  const data = {
+    ...BASE_DATA,
+    people: [{
+      id: 1, first_name: 'Alice', last_name: 'Smith', category: 'POI', connections: [],
+      osint_data: [{ type: 'Email', value: 'a@example.com', note: 'from breach dump' }],
+    }],
+    businesses: [{ id: 9, name: 'Acme Ltd', industry: 'Logistics' }],
+    todos: [{ id: 1, text: 'Task one', status: 'open', created_at: '2026-01-01' }],
+  };
+
+  test('options are no longer rewritten behind the caller\'s back', () => {
+    const opts = { reportType: 'summary', includePeople: true };
+    expect(resolveOptions(opts)).toEqual(opts);
+  });
+
+  test('unticking a section removes it, even for a non-comprehensive type', () => {
+    // Previously the type overrode the checkboxes, so this had no effect at all.
+    const withPeople = generateMarkdown(data, { ...REPORT_TYPE_PRESETS.summary, reportType: 'summary', includePeople: true });
+    const withoutPeople = generateMarkdown(data, { ...REPORT_TYPE_PRESETS.summary, reportType: 'summary', includePeople: false });
+    expect(withPeople).toContain(en.report.peopleProfiles);
+    expect(withoutPeople).not.toContain(en.report.peopleProfiles);
+  });
+
+  test('ticking a section adds it, even when the type preset excludes it', () => {
+    const md = generateMarkdown(data, { ...REPORT_TYPE_PRESETS.summary, reportType: 'summary', includeTodos: false, includeCharts: false, includeSummary: false, includeOsintData: true });
+    expect(md).toContain(en.report.osintIntelligence);
+  });
+
+  test('OSINT data actually reaches the report', () => {
+    const md = generateMarkdown(data, { reportType: 'comprehensive', includeOsintData: true });
+    expect(md).toContain(en.report.osintIntelligence);
+    expect(md).toContain('a@example.com');
+    expect(md).toContain('from breach dump');
+  });
+
+  test('OSINT section is omitted when unticked', () => {
+    const md = generateMarkdown(data, { reportType: 'comprehensive', includeOsintData: false });
+    expect(md).not.toContain(en.report.osintIntelligence);
+  });
+
+  test('businesses can be turned off', () => {
+    expect(generateMarkdown(data, { reportType: 'comprehensive', includeBusinesses: true })).toContain('Acme Ltd');
+    expect(generateMarkdown(data, { reportType: 'comprehensive', includeBusinesses: false })).not.toContain('Acme Ltd');
+  });
+});
+
+describe('report type presets', () => {
+  test('every preset covers every section the UI offers', () => {
+    Object.values(REPORT_TYPE_PRESETS).forEach((preset) => {
+      REPORT_SECTIONS.forEach((key) => expect(preset).toHaveProperty(key));
+    });
+  });
+
+  test('matchesPreset detects a customised selection', () => {
+    const clean = { reportType: 'summary', ...REPORT_TYPE_PRESETS.summary };
+    expect(matchesPreset(clean)).toBe(true);
+    expect(matchesPreset({ ...clean, includePeople: !clean.includePeople })).toBe(false);
+  });
+
+  test('an unknown report type is never reported as customised', () => {
+    expect(matchesPreset({ reportType: 'something-else' })).toBe(true);
+  });
+});
+
+// ── Word output in right-to-left languages (issue #99) ─────────────────────
+
+describe('Word paragraphs follow the report direction', () => {
+  beforeEach(() => Paragraph.mockClear());
+
+  test('LTR reports leave paragraphs as they were', () => {
+    p('Hello');
+    expect(Paragraph.mock.calls[0][0]).toEqual({ text: 'Hello' });
+  });
+
+  test('RTL reports mark every paragraph bidirectional', async () => {
+    i18n.addResourceBundle('fa', 'translation', { report: {} });
+    await i18n.changeLanguage('fa');
+    p('گزارش', 'H1', 'center');
+    expect(Paragraph.mock.calls[0][0]).toEqual({ text: 'گزارش', heading: 'H1', alignment: 'center', bidirectional: true });
+  });
+});
+
+describe('saved records in the report (#96)', () => {
+  const alex = { id: 1, first_name: 'Alex', last_name: 'Example', connections: [], locations: [] };
+  const rec = (data, extra = {}) => ({ person_id: 1, integration_id: 'leaks', tool_name: 'Leak search', operation: 'phone', query: '+10000000001', retrieved_at: '2026-11-05T10:00:00Z', occurrences: 1, data, ...extra });
+  const records = [
+    rec({ FULL_NAME: 'Alex Example', PHONE: '+10000000001', database: 'Sample database A' }),
+    rec({ FULL_NAME: 'A. Example', email: 'alex@example.com', note: 'a | b', database: 'Sample database C' }, { occurrences: 3 }),
+    rec(Object.fromEntries('abcdefgh'.split('').map((k) => [k, `v-${k}`])), { integration_id: 'wide', tool_name: 'Wide tool', query: 'x' }),
+    rec({ other: 'zz-not-this-subject' }, { person_id: 99 }),
+  ];
+  const data = { ...BASE_DATA, people: [alex], records };
+
+  test('a table per tool and search, normalized fields, provenance', () => {
+    const md = generateMarkdown(data, { ...BASE_OPTIONS, includeRecords: true });
+    expect(md).toContain('## Saved records');
+    expect(md).toContain('#### Leak search · searched for +10000000001 · 2 records');
+    expect(md).toContain('| FULL_NAME | database | PHONE | email | note | Found |');
+    expect(md).toMatch(/\| A\. Example \| Sample database C \| {2}\| alex@example\.com \| a \\\| b \| .+ · found 3 times \|/);
+    expect(md).not.toContain('zz-not-this-subject'); // another person's record stays out
+  });
+
+  test('wide groups are listed record by record', () => {
+    const md = generateMarkdown(data, { ...BASE_OPTIONS, includeRecords: true });
+    expect(md).toContain('#### Wide tool · searched for x · 1 record');
+    expect(md).toContain('**Record 1**');
+    expect(md).toContain('- **h:** v-h');
+  });
+
+  test('off when the box is unticked; on in the full and person presets', () => {
+    expect(generateMarkdown(data, { ...BASE_OPTIONS, includeRecords: false })).not.toContain('Saved records');
+    expect(REPORT_TYPE_PRESETS.comprehensive.includeRecords).toBe(true);
+    expect(REPORT_TYPE_PRESETS['person-profile'].includeRecords).toBe(true);
+    expect(REPORT_TYPE_PRESETS.summary.includeRecords).toBe(false);
   });
 });

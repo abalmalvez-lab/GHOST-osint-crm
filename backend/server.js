@@ -5,29 +5,15 @@ const { Pool } = require('pg');
 const path = require('path');
 const fs = require('fs');
 const multer = require('multer');
-const xml2js = require('xml2js');
-const { exec } = require('child_process');
-const util = require('util');
 const session = require('express-session');
+const helmet = require('helmet');
 const pgSession = require('connect-pg-simple')(session);
 
-// Add this with the other requires at the top
-let geocodingService;
+// All geocoding goes through ImprovedGeocodingService (Nominatim-throttled,
+// DB-cached). The legacy services/geocodingService.js was removed — its
+// exports were required but never called, and it bypassed the throttle.
 let improvedGeocodingService;
 const ImprovedGeocodingService = require('./services/improvedGeocodingService');
-try {
-  geocodingService = require('./services/geocodingService');
-  console.log('Geocoding services loaded successfully');
-} catch (err) {
-  console.error('Failed to load geocoding service:', err);
-  // Create dummy functions if service fails to load
-  geocodingService = {
-    geocodeAddress: async () => null,
-    batchGeocode: async (locations) => locations
-  };
-}
-const { geocodeAddress, batchGeocode } = geocodingService;
-const execPromise = util.promisify(exec);
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -66,6 +52,11 @@ function checkFileType(file, filetypes, cb) {
     cb('Error: Images Only (jpeg, jpg, png, gif)!');
   }
 }
+
+// Uploaded files (issue #97) are stored outside public/ — see
+// services/fileStorage.js. Created up front so the first upload can't fail on
+// a missing directory.
+require('./services/fileStorage').ensureDirs();
 
 // Validate critical environment variables — required in all environments
 const requiredEnvVars = ['SESSION_SECRET'];
@@ -112,443 +103,28 @@ const pool = new Pool({
 // Expose pool on app.locals so middleware can access it without circular requires
 app.locals.pool = pool;
 
-const createUpdatedAtTriggerFunction = `
-  CREATE OR REPLACE FUNCTION trigger_set_timestamp()
-  RETURNS TRIGGER AS $$
-  BEGIN
-    NEW.updated_at = NOW();
-    RETURN NEW;
-  END;
-  $$ LANGUAGE plpgsql;
-`;
-
-const applyUpdatedAtTrigger = async (client, tableName) => {
-  await client.query(`
-    DROP TRIGGER IF EXISTS set_timestamp ON ${tableName};
-    CREATE TRIGGER set_timestamp
-    BEFORE UPDATE ON ${tableName}
-    FOR EACH ROW
-    EXECUTE PROCEDURE trigger_set_timestamp();
-  `);
-  console.log(`Applied "updated_at" trigger to "${tableName}" table.`);
-};
+// ── Database bootstrap ────────────────────────────────────────────────────────
+// Schema lives in Knex migrations (backend/migrations/, issue #48). On boot:
+// run pending migrations, then ensure default model options (seeding re-runs
+// every start so upgrades can introduce new defaults). Schema changes go in
+// NEW migration files — never back into this file.
+const { seedDefaults } = require('./config/seedDefaults');
 
 const initializeDatabase = async () => {
-  let client;
+  const knex = require('knex')(require('./knexfile'));
   try {
-    client = await pool.connect();
-    console.log('Successfully connected to the PostgreSQL database.');
-    await client.query(createUpdatedAtTriggerFunction);
-    console.log('Ensured "trigger_set_timestamp" function exists.');
-
-    // Check if we need to migrate name to first_name and last_name
-    const nameColumnExists = await client.query(`
-      SELECT column_name 
-      FROM information_schema.columns 
-      WHERE table_name = 'people' AND column_name = 'name'
-    `);
-
-    if (nameColumnExists.rows.length > 0) {
-      console.log('Migrating name column to first_name and last_name...');
-      
-      // Add new columns if they don't exist
-      await client.query(`
-        ALTER TABLE people 
-        ADD COLUMN IF NOT EXISTS first_name VARCHAR(255),
-        ADD COLUMN IF NOT EXISTS last_name VARCHAR(255)
-      `);
-      
-      // Migrate existing data
-      await client.query(`
-        UPDATE people 
-        SET 
-          first_name = SPLIT_PART(name, ' ', 1),
-          last_name = CASE 
-            WHEN ARRAY_LENGTH(STRING_TO_ARRAY(name, ' '), 1) > 1 
-            THEN SUBSTRING(name FROM POSITION(' ' IN name) + 1)
-            ELSE ''
-          END
-        WHERE first_name IS NULL OR last_name IS NULL
-      `);
-      
-      // Drop the old name column
-      await client.query(`ALTER TABLE people DROP COLUMN IF EXISTS name`);
-      console.log('Migration completed successfully.');
-    }
-
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS people (
-        id SERIAL PRIMARY KEY,
-        first_name VARCHAR(255) NOT NULL,
-        last_name VARCHAR(255),
-        aliases TEXT[],
-        date_of_birth DATE,
-        category VARCHAR(100),
-        status VARCHAR(100),
-        crm_status VARCHAR(100),
-        case_name VARCHAR(255),
-        profile_picture_url TEXT,
-        notes TEXT,
-        osint_data JSONB DEFAULT '[]'::jsonb,
-        attachments JSONB DEFAULT '[]'::jsonb,
-        connections JSONB DEFAULT '[]'::jsonb,
-        locations JSONB DEFAULT '[]'::jsonb,
-        custom_fields JSONB DEFAULT '{}'::jsonb,
-        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
-    console.log('Checked/created "people" table.');
-    await applyUpdatedAtTrigger(client, 'people');
-
-    // Create indexes for people table
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_people_first_name ON people(first_name);
-      CREATE INDEX IF NOT EXISTS idx_people_last_name ON people(last_name);
-      CREATE INDEX IF NOT EXISTS idx_people_full_name ON people(first_name, last_name);
-      CREATE INDEX IF NOT EXISTS idx_people_category ON people(category);
-      CREATE INDEX IF NOT EXISTS idx_people_status ON people(status);
-      CREATE INDEX IF NOT EXISTS idx_people_case_name ON people(case_name);
-      CREATE INDEX IF NOT EXISTS idx_people_dob ON people(date_of_birth);
-    `);
-    console.log('Created indexes for "people" table.');
-
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS tools (
-        id SERIAL PRIMARY KEY,
-        name VARCHAR(255) NOT NULL,
-        link TEXT,
-        description TEXT,
-        category VARCHAR(100),
-        status VARCHAR(50),
-        tags TEXT[],
-        notes TEXT,
-        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
-    console.log('Checked/created "tools" table.');
-    await applyUpdatedAtTrigger(client, 'tools');
-
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS todos (
-        id SERIAL PRIMARY KEY,
-        text TEXT NOT NULL,
-        status VARCHAR(50) DEFAULT 'open',
-        last_update_comment TEXT,
-        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
-    console.log('Checked/created "todos" table.');
-    await applyUpdatedAtTrigger(client, 'todos');
-
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS custom_person_fields (
-        id SERIAL PRIMARY KEY,
-        field_name VARCHAR(100) NOT NULL UNIQUE,
-        field_label VARCHAR(255) NOT NULL,
-        field_type VARCHAR(50) NOT NULL,
-        options JSONB,
-        is_active BOOLEAN DEFAULT TRUE,
-        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
-    console.log('Checked/created "custom_person_fields" table.');
-    await applyUpdatedAtTrigger(client, 'custom_person_fields');
-
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS model_options (
-        id SERIAL PRIMARY KEY,
-        model_type VARCHAR(50) NOT NULL,
-        option_value VARCHAR(255) NOT NULL,
-        option_label VARCHAR(255),
-        is_active BOOLEAN DEFAULT TRUE,
-        display_order INTEGER DEFAULT 0,
-        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(model_type, option_value)
-      );
-    `);
-    console.log('Checked/created "model_options" table.');
-    await applyUpdatedAtTrigger(client, 'model_options');
-
-    // Insert default model options if they don't exist
-    const defaultOptions = [
-      // Categories
-      { model_type: 'person_category', option_value: 'Person of Interest', option_label: 'Person of Interest', display_order: 1 },
-      { model_type: 'person_category', option_value: 'Client', option_label: 'Client', display_order: 2 },
-      { model_type: 'person_category', option_value: 'Witness', option_label: 'Witness', display_order: 3 },
-      { model_type: 'person_category', option_value: 'Victim', option_label: 'Victim', display_order: 4 },
-      { model_type: 'person_category', option_value: 'Suspect', option_label: 'Suspect', display_order: 5 },
-      { model_type: 'person_category', option_value: 'Related to Person of Interest', option_label: 'Related to Person of Interest', display_order: 6 },
-      { model_type: 'person_category', option_value: 'Other', option_label: 'Other', display_order: 7 },
-      
-      // Statuses
-      { model_type: 'person_status', option_value: 'Open', option_label: 'Open', display_order: 1 },
-      { model_type: 'person_status', option_value: 'Being Investigated', option_label: 'Being Investigated', display_order: 2 },
-      { model_type: 'person_status', option_value: 'Closed', option_label: 'Closed', display_order: 3 },
-      { model_type: 'person_status', option_value: 'On Hold', option_label: 'On Hold', display_order: 4 },
-      
-      // CRM Statuses
-      { model_type: 'crm_status', option_value: 'new_lead', option_label: 'New Lead', display_order: 1 },
-      { model_type: 'crm_status', option_value: 'attempted_engage', option_label: 'Attempted to Engage', display_order: 2 },
-      { model_type: 'crm_status', option_value: 'engaged', option_label: 'Engaged', display_order: 3 },
-      { model_type: 'crm_status', option_value: 'qualified', option_label: 'Qualified', display_order: 4 },
-      { model_type: 'crm_status', option_value: 'follow_up', option_label: 'Follow Up', display_order: 5 },
-      { model_type: 'crm_status', option_value: 'archived', option_label: 'Archived', display_order: 6 },
-      { model_type: 'crm_status', option_value: 'active', option_label: 'Active', display_order: 7 },
-      { model_type: 'crm_status', option_value: 'awaiting_response', option_label: 'Awaiting Response', display_order: 8 },
-      
-      // Task Statuses
-      { model_type: 'task_status', option_value: 'open', option_label: 'Open', display_order: 1 },
-      { model_type: 'task_status', option_value: 'in_progress', option_label: 'In Progress', display_order: 2 },
-      { model_type: 'task_status', option_value: 'on_hold', option_label: 'On Hold', display_order: 3 },
-      { model_type: 'task_status', option_value: 'attention', option_label: 'Attention / Issue', display_order: 4 },
-      { model_type: 'task_status', option_value: 'done', option_label: 'Done', display_order: 5 },
-      { model_type: 'task_status', option_value: 'cancelled', option_label: 'Cancelled', display_order: 6 },
-      
-      // Connection Types
-      { model_type: 'connection_type', option_value: 'family', option_label: 'Family', display_order: 1 },
-      { model_type: 'connection_type', option_value: 'friend', option_label: 'Friend', display_order: 2 },
-      { model_type: 'connection_type', option_value: 'enemy', option_label: 'Enemy', display_order: 3 },
-      { model_type: 'connection_type', option_value: 'associate', option_label: 'Associate', display_order: 4 },
-      { model_type: 'connection_type', option_value: 'employer', option_label: 'Employer/Employee', display_order: 5 },
-      { model_type: 'connection_type', option_value: 'suspect', option_label: 'Suspect Connection', display_order: 6 },
-      { model_type: 'connection_type', option_value: 'witness', option_label: 'Witness', display_order: 7 },
-      { model_type: 'connection_type', option_value: 'victim', option_label: 'Victim', display_order: 8 },
-      { model_type: 'connection_type', option_value: 'other', option_label: 'Other', display_order: 9 },
-      
-      // Location Types
-      { model_type: 'location_type', option_value: 'primary_residence', option_label: 'Primary Residence', display_order: 1 },
-      { model_type: 'location_type', option_value: 'holiday_home', option_label: 'Holiday Home', display_order: 2 },
-      { model_type: 'location_type', option_value: 'work', option_label: 'Work', display_order: 3 },
-      { model_type: 'location_type', option_value: 'favorite_hotel', option_label: 'Favorite Hotel', display_order: 4 },
-      { model_type: 'location_type', option_value: 'yacht_location', option_label: 'Yacht Location', display_order: 5 },
-      { model_type: 'location_type', option_value: 'other', option_label: 'Other', display_order: 6 }
-    ];
-
-    for (const option of defaultOptions) {
-      await client.query(`
-        INSERT INTO model_options (model_type, option_value, option_label, display_order)
-        VALUES ($1, $2, $3, $4)
-        ON CONFLICT (model_type, option_value) DO NOTHING
-      `, [option.model_type, option.option_value, option.option_label, option.display_order]);
-    }
-    console.log('Ensured default model options exist.');
-
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS audit_logs (
-        id SERIAL PRIMARY KEY,
-        entity_type VARCHAR(50) NOT NULL,
-        entity_id INTEGER NOT NULL,
-        field_name VARCHAR(100),
-        old_value TEXT,
-        new_value TEXT,
-        action VARCHAR(50) NOT NULL,
-        user_id INTEGER,
-        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
-    console.log('Checked/created "audit_logs" table.');
-
-    // Create indexes for audit_logs table
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_audit_logs_entity ON audit_logs(entity_type, entity_id);
-      CREATE INDEX IF NOT EXISTS idx_audit_logs_user_id ON audit_logs(user_id);
-      CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at DESC);
-      CREATE INDEX IF NOT EXISTS idx_audit_logs_action ON audit_logs(action);
-    `);
-    console.log('Created indexes for "audit_logs" table.');
-
-    // Create users table for authentication
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY,
-        username VARCHAR(100) NOT NULL UNIQUE,
-        email VARCHAR(255) UNIQUE,
-        password_hash VARCHAR(255) NOT NULL,
-        first_name VARCHAR(100),
-        last_name VARCHAR(100),
-        role VARCHAR(20) NOT NULL DEFAULT 'user' CHECK (role IN ('admin', 'user')),
-        is_active BOOLEAN DEFAULT TRUE,
-        last_login TIMESTAMPTZ,
-        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
-    console.log('Checked/created "users" table.');
-    await applyUpdatedAtTrigger(client, 'users');
-
-    // Make email nullable for existing databases
-    await client.query(`
-      ALTER TABLE users ALTER COLUMN email DROP NOT NULL;
-    `);
-    console.log('Ensured email column is nullable in "users" table.');
-
-    // Create indexes for users table
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
-      CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
-      CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
-    `);
-    console.log('Created indexes for "users" table.');
-
-    // Add foreign key constraint to audit_logs after users table exists
-    await client.query(`
-      DO $$
-      BEGIN
-        IF NOT EXISTS (
-          SELECT 1 FROM information_schema.table_constraints
-          WHERE constraint_name = 'fk_audit_logs_user'
-        ) THEN
-          ALTER TABLE audit_logs
-            ADD CONSTRAINT fk_audit_logs_user
-            FOREIGN KEY (user_id)
-            REFERENCES users(id)
-            ON DELETE SET NULL;
-        END IF;
-      END $$;
-    `);
-    console.log('Added foreign key constraint from audit_logs to users.');
-
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS cases (
-        id SERIAL PRIMARY KEY,
-        case_name VARCHAR(255) NOT NULL UNIQUE,
-        description TEXT,
-        status VARCHAR(50) DEFAULT 'active',
-        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
-    console.log('Checked/created "cases" table.');
-    await applyUpdatedAtTrigger(client, 'cases');
-
-    // Create businesses table
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS businesses (
-        id SERIAL PRIMARY KEY,
-        name VARCHAR(255) NOT NULL,
-        type VARCHAR(100),
-        industry VARCHAR(100),
-        address TEXT,
-        city VARCHAR(100),
-        state VARCHAR(100),
-        country VARCHAR(100),
-        postal_code VARCHAR(20),
-        latitude DECIMAL(10, 8),
-        longitude DECIMAL(11, 8),
-        phone VARCHAR(50),
-        email VARCHAR(255),
-        website TEXT,
-        owner_person_id INTEGER REFERENCES people(id) ON DELETE SET NULL,
-        registration_number VARCHAR(100),
-        registration_date DATE,
-        status VARCHAR(50) DEFAULT 'active',
-        employees JSONB DEFAULT '[]'::jsonb,
-        notes TEXT,
-        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
-    console.log('Checked/created "businesses" table.');
-    await applyUpdatedAtTrigger(client, 'businesses');
-
-    // Create travel_history table for detailed travel tracking
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS travel_history (
-        id SERIAL PRIMARY KEY,
-        person_id INTEGER NOT NULL REFERENCES people(id) ON DELETE CASCADE,
-        location_type VARCHAR(50),
-        location_name VARCHAR(255),
-        address TEXT,
-        city VARCHAR(100),
-        state VARCHAR(100),
-        country VARCHAR(100),
-        postal_code VARCHAR(20),
-        latitude DECIMAL(10, 8),
-        longitude DECIMAL(11, 8),
-        arrival_date TIMESTAMPTZ,
-        departure_date TIMESTAMPTZ,
-        purpose VARCHAR(100),
-        transportation_mode VARCHAR(50),
-        notes TEXT,
-        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
-    console.log('Checked/created "travel_history" table.');
-    await applyUpdatedAtTrigger(client, 'travel_history');
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_travel_history_person_id ON travel_history(person_id);
-      CREATE INDEX IF NOT EXISTS idx_travel_history_dates ON travel_history(arrival_date, departure_date);
-      CREATE INDEX IF NOT EXISTS idx_travel_history_location ON travel_history(country, city);
-    `);
-
-    // Create wireless_networks table
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS wireless_networks (
-        id SERIAL PRIMARY KEY,
-        ssid VARCHAR(255) NOT NULL,
-        bssid VARCHAR(17),
-        latitude DOUBLE PRECISION,
-        longitude DOUBLE PRECISION,
-        accuracy DOUBLE PRECISION,
-        encryption VARCHAR(50),
-        signal_strength INTEGER,
-        frequency VARCHAR(20),
-        channel INTEGER,
-        network_type VARCHAR(20) DEFAULT 'WIFI',
-        confidence_level VARCHAR(20),
-        first_seen TIMESTAMP,
-        last_seen TIMESTAMP,
-        scan_date TIMESTAMP,
-        person_id INTEGER REFERENCES people(id) ON DELETE SET NULL,
-        association_note TEXT,
-        association_confidence VARCHAR(20),
-        import_source VARCHAR(255),
-        import_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        notes TEXT,
-        tags TEXT[],
-        area_name VARCHAR(255),
-        password VARCHAR(255),
-        associated_person_ids INTEGER[],
-        associated_business_ids INTEGER[],
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
-    console.log('Checked/created "wireless_networks" table.');
-    await applyUpdatedAtTrigger(client, 'wireless_networks');
-
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_wireless_ssid ON wireless_networks(ssid);
-      CREATE INDEX IF NOT EXISTS idx_wireless_location ON wireless_networks(latitude, longitude);
-      CREATE INDEX IF NOT EXISTS idx_wireless_person ON wireless_networks(person_id);
-    `);
-
-    // Backfill associated_person_ids array from singular person_id (issue #41 migration).
-    // Idempotent: only copies when the array is empty/null.
-    // Note: wireless_networks has no singular business_id column, so no business backfill needed.
-    await client.query(`
-      UPDATE wireless_networks
-      SET associated_person_ids = ARRAY[person_id]
-      WHERE person_id IS NOT NULL
-        AND (associated_person_ids IS NULL OR cardinality(associated_person_ids) = 0);
-    `);
-    console.log('Backfilled wireless_networks.associated_person_ids from person_id.');
-
-  } catch (err) {
-    console.error('Error during database initialization:', err.stack);
-    process.exit(1);
+    const [batchNo, applied] = await knex.migrate.latest();
+    console.log(applied.length
+      ? `Applied ${applied.length} database migration(s) in batch ${batchNo}: ${applied.join(', ')}`
+      : 'Database schema is up to date.');
   } finally {
-    if (client) {
-      client.release();
-    }
+    await knex.destroy();
   }
+  await seedDefaults(pool);
+  // Built-in OSINT tool integrations (issue #96) ship as JSON files; refresh
+  // them on every start so an upgrade brings the new versions.
+  const synced = await require('./services/integrations/registry').syncBuiltins(pool);
+  console.log(`Built-in integrations available: ${synced}`);
 };
 
 initializeDatabase().then(() => {
@@ -556,10 +132,56 @@ initializeDatabase().then(() => {
   improvedGeocodingService = new ImprovedGeocodingService(pool);
   app.locals.improvedGeocodingService = improvedGeocodingService;
   console.log('Improved geocoding service initialized');
+
+  // Update availability check — reads the public releases API, downloads
+  // nothing, and can be disabled entirely in Settings.
+  const { UpdateCheckService } = require('./services/updateCheckService');
+  app.locals.updateCheckService = new UpdateCheckService(pool, APP_VERSION);
+
+  // Archived-project retention sweep (issue #88). Off unless an operator sets
+  // a retention window in Settings; reads the policy live on each run.
+  const { ProjectRetentionService } = require('./services/projectRetentionService');
+  app.locals.projectRetentionService = new ProjectRetentionService(pool);
+  app.locals.projectRetentionService.start();
+
+  // Uploaded files (issue #97): removes stored files whose row is gone, e.g.
+  // after a project delete.
+  const { FileSweepService } = require('./services/fileStorage');
+  app.locals.fileSweepService = new FileSweepService(pool);
+  app.locals.fileSweepService.start();
+  app.locals.projectRetentionService.onProjectDeleted = () => app.locals.fileSweepService.requestSweep();
+}).catch((err) => {
+  console.error('Error during database initialization:', err.stack);
+  // An unreachable database otherwise shows up only as "container is
+  // unhealthy" in `docker compose up` (issue #94), so name the likely cause.
+  if (['ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'ETIMEDOUT'].includes(err.code)) {
+    const target = `${process.env.DB_HOST || 'db'}:${process.env.DB_PORT || '5432'}`;
+    console.error(`Cannot reach PostgreSQL at ${target}. If you use the bundled database, check that ` +
+      'the db container is running (`docker compose ps -a`). If you use your own server, check ' +
+      'DB_HOST/DB_PORT in .env.');
+  }
+  process.exit(1);
 });
 
-// Trust first proxy (nginx, docker network) so express-rate-limit reads real client IP
-app.set('trust proxy', 1);
+// Proxies allowed to name the client's address for the rate limits: GHOST's
+// nginx by default; TRUST_PROXY=2 behind one more reverse proxy (#115).
+const trustProxy = require('./utils/trustProxy').readTrustProxy(process.env.TRUST_PROXY);
+if (trustProxy.warning) console.warn(trustProxy.warning);
+app.set('trust proxy', trustProxy.value);
+
+// Security headers on every API response (helmet). The frontend's pages get
+// theirs from nginx (frontend/security-headers.conf). The API returns JSON
+// and files, never pages, so its policy blocks everything; the API docs page
+// and file downloads set their own. HSTS is left to nginx, which sends it
+// only behind an HTTPS proxy. Referrer-Policy is no-referrer (helmet default).
+app.use(helmet({
+  contentSecurityPolicy: {
+    useDefaults: false,
+    directives: { defaultSrc: ["'none'"], frameAncestors: ["'none'"], baseUri: ["'none'"], formAction: ["'none'"] },
+  },
+  strictTransportSecurity: false,
+  xFrameOptions: { action: 'deny' },
+}));
 
 app.use(cors({
   origin: process.env.FRONTEND_URL || 'http://localhost:3000',
@@ -569,8 +191,14 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use('/public', express.static(path.join(__dirname, 'public')));
 
+// Personal API tokens (issue #90): "Authorization: Bearer ghost_…" signs a
+// request in as the token's owner. Runs first; such requests skip the
+// session store entirely.
+const { apiTokenAuth } = require('./middleware/apiToken');
+app.use(apiTokenAuth(pool));
+
 // Session configuration
-app.use(session({
+const sessionMiddleware = session({
   store: new pgSession({
     pool: pool,
     tableName: 'user_sessions',
@@ -585,52 +213,117 @@ app.use(session({
     sameSite: 'strict',
     maxAge: 30 * 24 * 60 * 60 * 1000 // 30 days
   }
-}));
+});
+app.use(require('./middleware/insecureCookieHint').insecureCookieHint({ secureCookie: process.env.NODE_ENV === 'production' }));
+app.use((req, res, next) => (req.apiToken ? next() : sessionMiddleware(req, res, next)));
+
+// Single sign-on sessions end when the identity provider's session ends
+// (issue #105); see the middleware for how.
+const { ssoSessionCheck } = require('./middleware/ssoSessionCheck');
+app.use(ssoSessionCheck());
 
 // Import audit logging middleware
 const { auditMiddleware } = require('./middleware/auditLog');
 const { requireAuth, requireAdmin } = require('./middleware/auth');
-const { geocodingLimiter } = require('./middleware/rateLimiters');
 app.use(auditMiddleware);
 
 // Import and mount routes
 const authRoutes = require('./routes/auth');
+const oidcRoutes = require('./routes/oidc');
+const accountRoutes = require('./routes/account');
 const usersRoutes = require('./routes/users');
 const auditLogsRoutes = require('./routes/auditLogs');
-const entityNetworkRoutes = require('./routes/entityNetwork');
 const businessesRoutes = require('./routes/businesses');
+const relationshipsRoutes = require('./routes/relationships');
 const casesRoutes = require('./routes/cases');
+const projectsRoutes = require('./routes/projects');
 const geocodingRoutes = require('./routes/geocoding');
 const locationsRoutes = require('./routes/locations');
 const peopleRoutes = require('./routes/people');
 const searchRoutes = require('./routes/search');
+// Single source of truth for the running version — surfaced by /api/version
+// and used to decide whether a newer release exists.
+const APP_VERSION = require('./package.json').version;
+const { installInfo } = require('./services/updateCheckService');
+
 const settingsRoutes = require('./routes/settings');
 const todosRoutes = require('./routes/todos');
 const toolsRoutes = require('./routes/tools');
 const travelHistoryRoutes = require('./routes/travelHistory');
 const wirelessNetworksRoutes = require('./routes/wirelessNetworks');
+const propertiesRoutes = require('./routes/properties');
+const assetsRoutes = require('./routes/assets');
+const cryptoWalletsRoutes = require('./routes/cryptoWallets');
+const transactionsRoutes = require('./routes/transactions');
+const ledgerRoutes = require('./routes/ledger');
+const graphRoutes = require('./routes/graph');
+const filesRoutes = require('./routes/files');
+const osintRecordsRoutes = require('./routes/osintRecords');
+const integrationsRoutes = require('./routes/integrations');
+const scratchpadRoutes = require('./routes/scratchpad');
+const openapiSpec = require('./utils/openapiSpec');
 
+// Machine-readable API description generated from the Zod schemas (issue #44).
+// Mounted before the generic /api routers so no catch-all pattern shadows it.
+app.get('/api/openapi.json', requireAuth, (req, res) => {
+  res.json(openapiSpec);
+});
+
+// Browsable version of that document (issue #93). On by default; an operator
+// who doesn't want it reachable can switch it off.
+if (process.env.API_DOCS_ENABLED !== 'false') {
+  app.use('/api/docs', require('./routes/apiDocs'));
+}
+
+app.use('/api/auth/oidc', oidcRoutes);
 app.use('/api/auth', authRoutes);
+app.use('/api/account', accountRoutes);
 app.use('/api/users', usersRoutes);
 app.use('/api/audit-logs', auditLogsRoutes);
-app.use('/api', entityNetworkRoutes);
 app.use('/api/businesses', businessesRoutes);
+app.use('/api/relationships', relationshipsRoutes);
 app.use('/api/cases', casesRoutes);
+app.use('/api/projects', projectsRoutes);
 app.use('/api/geocode', geocodingRoutes);
 app.use('/api/locations', locationsRoutes);
 app.use('/api/people', peopleRoutes);
 app.use('/api/search', searchRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/todos', todosRoutes);
+app.use('/api/scratchpad', scratchpadRoutes);
 app.use('/api/tools', toolsRoutes);
 app.use('/api', travelHistoryRoutes);
 app.use('/api/wireless-networks', wirelessNetworksRoutes);
+app.use('/api/properties', propertiesRoutes);
+app.use('/api/assets', assetsRoutes);
+app.use('/api/crypto-wallets', cryptoWalletsRoutes);
+app.use('/api/transactions', transactionsRoutes);
+app.use('/api', ledgerRoutes);
+app.use('/api/graph', graphRoutes);
+app.use('/api/files', filesRoutes);
+app.use('/api/records', osintRecordsRoutes);
+app.use('/api/integrations', integrationsRoutes);
 
 app.get('/api', (req, res) => {
   res.json({ message: "Hello from the OSINT CRM Backend!" });
 });
 
 // Health check endpoint for Docker healthcheck and monitoring
+// Release notes and how this instance is installed (for the update dialog's
+// commands) are for admins only; everyone else gets the version numbers.
+app.get('/api/version', requireAuth, async (req, res) => {
+  const service = req.app.locals.updateCheckService;
+  if (!service) return res.json({ currentVersion: APP_VERSION, checkEnabled: false, updateAvailable: false });
+  try {
+    const { releases, ...status } = await service.getStatus({ force: req.query.force === '1' });
+    if (req.session.userRole !== 'admin') return res.json(status);
+    res.json({ ...status, releases: releases || [], install: installInfo() });
+  } catch (err) {
+    console.error('Error checking for updates:', err.message);
+    res.json({ currentVersion: APP_VERSION, checkEnabled: true, updateAvailable: false, checkFailed: true });
+  }
+});
+
 app.get('/api/health', async (req, res) => {
   try {
     // Check database connectivity
@@ -663,7 +356,13 @@ app.post('/api/upload/logo', requireAdmin, logoUpload.single('appLogo'), (req, r
 // Export/Import endpoints
 app.get('/api/export', requireAdmin, async (req, res) => {
   try {
-    const [people, tools, todos, customFields, modelOptions, cases, travelHistory, businesses] = await Promise.all([
+    // "Export All Data" has to mean all of it — assets, transactions,
+    // properties and wireless networks were silently absent, which made the
+    // file unusable for backup or migration (issue #74).
+    const [
+      people, tools, todos, customFields, modelOptions, cases, travelHistory,
+      businesses, properties, assets, transactions, wirelessNetworks, osintRecords,
+    ] = await Promise.all([
       pool.query('SELECT * FROM people'),
       pool.query('SELECT * FROM tools'),
       pool.query('SELECT * FROM todos'),
@@ -671,15 +370,25 @@ app.get('/api/export', requireAdmin, async (req, res) => {
       pool.query('SELECT * FROM model_options'),
       pool.query('SELECT * FROM cases'),
       pool.query('SELECT * FROM travel_history'),
-      pool.query('SELECT * FROM businesses')
+      pool.query('SELECT * FROM businesses'),
+      pool.query('SELECT * FROM properties'),
+      pool.query('SELECT * FROM assets'),
+      pool.query('SELECT * FROM transactions'),
+      pool.query('SELECT * FROM wireless_networks'),
+      pool.query('SELECT * FROM osint_records ORDER BY id'),
     ]);
 
     const exportData = {
-      version: '1.2',
+      version: '1.4',
       exportDate: new Date().toISOString(),
       data: {
         people: people.rows,
         businesses: businesses.rows,
+        properties: properties.rows,
+        assets: assets.rows,
+        transactions: transactions.rows,
+        wirelessNetworks: wirelessNetworks.rows,
+        osintRecords: osintRecords.rows,
         tools: tools.rows,
         todos: todos.rows,
         customFields: customFields.rows,
@@ -708,20 +417,17 @@ app.post('/api/import', requireAdmin, async (req, res) => {
   // ?strict=1 — roll back on any record failure instead of best-effort partial import
   const strictMode = req.query.strict === '1';
 
+  // Every case-scoped table now has a NOT NULL project_id (issue #83), so
+  // imported data has to land somewhere explicit -- there's no reasonable
+  // default project to guess at import time.
+  const importProjectId = req.query.project_id ? parseInt(req.query.project_id, 10) : null;
+  if (!importProjectId) {
+    return res.status(400).json({ error: 'project_id is required (pass ?project_id=<id> — choose the project this import should land in)' });
+  }
+
+  const { syncPersonConnections } = require('./routes/relationships');
+
   const client = await pool.connect();
-  
-  // Helper function to ensure proper JSON formatting
-  const ensureJSON = (data) => {
-    if (data === null || data === undefined) return null;
-    if (typeof data === 'string') {
-      try {
-        return JSON.parse(data);
-      } catch (e) {
-        return data;
-      }
-    }
-    return data;
-  };
   
   // Helper function to ensure proper JSON string for JSONB fields
   const toJSONString = (data) => {
@@ -743,7 +449,7 @@ app.post('/api/import', requireAdmin, async (req, res) => {
     try {
       await fn();
     } catch (err) {
-      console.warn(`Import warning [${label}]:`, err.message);
+      console.warn('Import warning:', label, err.message);
       importErrors.push({ record: label, error: err.message });
       // In strict mode, re-throw so the transaction rolls back
       if (strictMode) throw err;
@@ -756,18 +462,54 @@ app.post('/api/import', requireAdmin, async (req, res) => {
     // Create a mapping for person IDs (old ID -> new ID)
     const personIdMapping = {};
 
-    // Import in order to respect foreign key constraints
+    // Import in order to respect foreign key constraints.
+    //
+    // Case names are unique across the whole instance. A case of the same
+    // name in the target project is reused (its description and status
+    // updated); one in ANOTHER project is never touched or linked to: the
+    // imported case gets the project's name appended instead. Without this,
+    // importing the same file into a second project updated the first
+    // project's case and linked the new records into it.
+    // importedCases: name in the file -> { id, name } in this project.
+    const importedCases = {};
+    // Exported rows carry case_id; the file's own case list turns it into a name.
+    const fileCaseName = {};
+    for (const c of importData.data.cases || []) if (c && c.id != null) fileCaseName[c.id] = c.case_name;
+    const caseNameOf = (row) => row.case_name || (row.case_id != null ? fileCaseName[row.case_id] : null) || null;
     if (importData.data.cases) {
+      const projectName = (await client.query('SELECT name FROM projects WHERE id = $1', [importProjectId])).rows[0]?.name || `project ${importProjectId}`;
       for (const caseItem of importData.data.cases) {
-        await tryInsert(`case:${caseItem.case_name}`, () => client.query(
-          `INSERT INTO cases (case_name, description, status)
-           VALUES ($1, $2, $3)
-           ON CONFLICT (case_name) DO UPDATE
-           SET description = EXCLUDED.description, status = EXCLUDED.status`,
-          [caseItem.case_name, caseItem.description, caseItem.status]
-        ));
+        if (!caseItem.case_name) continue;
+        await tryInsert(`case:${caseItem.case_name}`, async () => {
+          const existing = await client.query('SELECT id, project_id FROM cases WHERE case_name = $1', [caseItem.case_name]);
+          const row = existing.rows[0];
+          if (row && row.project_id === importProjectId) {
+            await client.query('UPDATE cases SET description = $1, status = $2 WHERE id = $3',
+              [caseItem.description, caseItem.status, row.id]);
+            importedCases[caseItem.case_name] = { id: row.id, name: caseItem.case_name };
+            return;
+          }
+          let name = row ? `${caseItem.case_name} (${projectName})` : caseItem.case_name;
+          for (let n = 2; (await client.query('SELECT 1 FROM cases WHERE case_name = $1', [name])).rows.length; n++) {
+            name = `${caseItem.case_name} (${projectName} ${n})`;
+          }
+          const created = await client.query(
+            'INSERT INTO cases (case_name, description, status, project_id) VALUES ($1, $2, $3, $4) RETURNING id',
+            [name, caseItem.description, caseItem.status, importProjectId]
+          );
+          importedCases[caseItem.case_name] = { id: created.rows[0].id, name };
+        });
       }
     }
+    // A case named in a record but not in the file's case list may still
+    // exist in the target project.
+    const caseFor = async (caseName) => {
+      if (!caseName) return null;
+      if (importedCases[caseName]) return importedCases[caseName];
+      const { rows } = await client.query('SELECT id FROM cases WHERE case_name = $1 AND project_id = $2', [caseName, importProjectId]);
+      importedCases[caseName] = rows[0] ? { id: rows[0].id, name: caseName } : null;
+      return importedCases[caseName];
+    };
 
     if (importData.data.customFields) {
       for (const field of importData.data.customFields) {
@@ -805,22 +547,26 @@ app.post('/api/import', requireAdmin, async (req, res) => {
         const customFieldsJSON = person.custom_fields ? toJSONString(person.custom_fields) : '{}';
 
         try {
+          // case_id is what groups people under a case (issue #83); case_name
+          // alone left imported people outside every case.
+          const personCase = await caseFor(caseNameOf(person));
           const result = await client.query(
-            `INSERT INTO people (first_name, last_name, aliases, date_of_birth, category, status,
-                                 crm_status, case_name, profile_picture_url, notes, osint_data,
-                                 attachments, connections, locations, custom_fields)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb, $13::jsonb, $14::jsonb, $15::jsonb)
+            `INSERT INTO people (first_name, last_name, patronymic, aliases, date_of_birth, category, status,
+                                 crm_status, case_name, case_id, profile_picture_url, notes, osint_data,
+                                 attachments, connections, locations, custom_fields, project_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14::jsonb, $15::jsonb, $16::jsonb, $17::jsonb, $18)
              RETURNING id`,
-            [person.first_name, person.last_name, person.aliases, person.date_of_birth,
-             person.category, person.status, person.crm_status, person.case_name,
+            [person.first_name, person.last_name, person.patronymic || null, person.aliases,
+             person.date_of_birth, person.category, person.status, person.crm_status,
+             personCase ? personCase.name : caseNameOf(person), personCase ? personCase.id : null,
              person.profile_picture_url, person.notes, osintDataJSON, attachmentsJSON,
-             connectionsJSON, locationsJSON, customFieldsJSON]
+             connectionsJSON, locationsJSON, customFieldsJSON, importProjectId]
           );
           if (person.id && result.rows[0]) {
             personIdMapping[person.id] = result.rows[0].id;
           }
         } catch (err) {
-          console.warn(`Import warning [person:${person.first_name} ${person.last_name}]:`, err.message);
+          console.warn('Import warning: person', person.first_name, person.last_name, err.message);
           importErrors.push({ record: `person:${person.first_name} ${person.last_name}`, error: err.message });
         }
       }
@@ -839,9 +585,9 @@ app.post('/api/import', requireAdmin, async (req, res) => {
     if (importData.data.todos) {
       for (const todo of importData.data.todos) {
         await tryInsert(`todo:${todo.text?.slice(0, 30)}`, () => client.query(
-          `INSERT INTO todos (text, status, last_update_comment)
-           VALUES ($1, $2, $3)`,
-          [todo.text, todo.status, todo.last_update_comment]
+          `INSERT INTO todos (text, status, last_update_comment, project_id)
+           VALUES ($1, $2, $3, $4)`,
+          [todo.text, todo.status, todo.last_update_comment, importProjectId]
         ));
       }
     }
@@ -853,12 +599,12 @@ app.post('/api/import', requireAdmin, async (req, res) => {
           await tryInsert(`travel:person${travel.person_id}`, () => client.query(
             `INSERT INTO travel_history
              (person_id, location_type, location_name, address, city, state, country, postal_code,
-              latitude, longitude, arrival_date, departure_date, purpose, transportation_mode, notes)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+              latitude, longitude, arrival_date, departure_date, purpose, transportation_mode, notes, project_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
             [newPersonId, travel.location_type, travel.location_name, travel.address,
              travel.city, travel.state, travel.country, travel.postal_code,
              travel.latitude, travel.longitude, travel.arrival_date, travel.departure_date,
-             travel.purpose, travel.transportation_mode, travel.notes]
+             travel.purpose, travel.transportation_mode, travel.notes, importProjectId]
           ));
         } else {
           importErrors.push({ record: `travel:person${travel.person_id}`, error: 'Person not found in import' });
@@ -870,7 +616,11 @@ app.post('/api/import', requireAdmin, async (req, res) => {
     const businessIdMapping = {};
     if (importData.data.businesses) {
       for (const business of importData.data.businesses) {
-        const employeesJSON = business.employees ? toJSONString(business.employees) : '[]';
+        // Employees linked to a person point at that person's new id.
+        const employees = Array.isArray(business.employees)
+          ? business.employees.map((e) => (e && e.person_id != null ? { ...e, person_id: personIdMapping[e.person_id] || null } : e))
+          : business.employees;
+        const employeesJSON = employees ? toJSONString(employees) : '[]';
         const remappedOwnerId = business.owner_person_id
           ? (personIdMapping[business.owner_person_id] || null)
           : null;
@@ -878,14 +628,14 @@ app.post('/api/import', requireAdmin, async (req, res) => {
         const result = await client.query(
           `INSERT INTO businesses (name, type, industry, address, city, state, country, postal_code,
                                    latitude, longitude, phone, email, website, owner_person_id,
-                                   registration_number, registration_date, status, employees, notes)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18::jsonb, $19)
+                                   registration_number, registration_date, status, employees, notes, project_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18::jsonb, $19, $20)
            RETURNING id`,
           [business.name, business.type, business.industry, business.address, business.city,
            business.state, business.country, business.postal_code, business.latitude, business.longitude,
            business.phone, business.email, business.website, remappedOwnerId,
            business.registration_number, business.registration_date, business.status,
-           employeesJSON, business.notes]
+           employeesJSON, business.notes, importProjectId]
         );
 
         if (business.id && result.rows[0]) {
@@ -894,28 +644,196 @@ app.post('/api/import', requireAdmin, async (req, res) => {
       }
     }
 
-    // Update connections with the new person IDs
+    // ── Entities absent from the old export/import entirely (issue #74) ──────
+    // Imported after people and businesses so their owner/party references can
+    // be remapped onto the newly-inserted ids. Cases are matched by name, since
+    // case_id is not stable across installs.
+    // Cases of this project only (see importedCases above).
+    const caseIdByName = {};
+    for (const [fileName, c] of Object.entries(importedCases)) if (c) caseIdByName[fileName] = c.id;
+    {
+      const rows = await client.query('SELECT id, case_name FROM cases WHERE project_id = $1', [importProjectId]);
+      rows.rows.forEach(r => { if (!(r.case_name in caseIdByName)) caseIdByName[r.case_name] = r.id; });
+    }
+    const remapCase = (row) => {
+      const name = caseNameOf(row);
+      return name && caseIdByName[name] ? caseIdByName[name] : null;
+    };
+
+    const propertyIdMapping = {};
+    if (importData.data.properties) {
+      for (const prop of importData.data.properties) {
+        await tryInsert(`property:${prop.name}`, async () => {
+          const result = await client.query(
+            `INSERT INTO properties (name, property_type, description, address, city, state, country,
+                                     postal_code, latitude, longitude, owner_person_id, case_id, notes, project_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING id`,
+            [prop.name, prop.property_type, prop.description, prop.address, prop.city, prop.state,
+             prop.country, prop.postal_code, prop.latitude, prop.longitude,
+             prop.owner_person_id ? (personIdMapping[prop.owner_person_id] || null) : null,
+             remapCase(prop), prop.notes, importProjectId]
+          );
+          if (prop.id && result.rows[0]) propertyIdMapping[prop.id] = result.rows[0].id;
+        });
+      }
+    }
+
+    const assetIdMapping = {};
+    if (importData.data.assets) {
+      for (const asset of importData.data.assets) {
+        await tryInsert(`asset:${asset.name}`, async () => {
+          const result = await client.query(
+            `INSERT INTO assets (name, category, identifier, description, notes, estimated_value,
+                                 currency, status, location_mode, location_person_id, location_ref,
+                                 location_name, address, city, state, country, postal_code,
+                                 latitude, longitude, case_id, project_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+             RETURNING id`,
+            [asset.name, asset.category, asset.identifier, asset.description, asset.notes,
+             asset.estimated_value, asset.currency, asset.status, asset.location_mode,
+             asset.location_person_id ? (personIdMapping[asset.location_person_id] || null) : null,
+             asset.location_ref, asset.location_name, asset.address, asset.city, asset.state,
+             asset.country, asset.postal_code, asset.latitude, asset.longitude, remapCase(asset), importProjectId]
+          );
+          if (asset.id && result.rows[0]) assetIdMapping[asset.id] = result.rows[0].id;
+        });
+      }
+    }
+
+    if (importData.data.transactions) {
+      for (const tx of importData.data.transactions) {
+        await tryInsert(`transaction:${tx.item_label || tx.transaction_type}`, () => client.query(
+          `INSERT INTO transactions (transaction_type, item_label, item_category, subject_asset_id,
+                                     subject_business_id, subject_property_id, from_person_id,
+                                     from_business_id, from_external, to_person_id, to_business_id,
+                                     to_external, value, currency, occurred_on, location_business_id,
+                                     location_property_id, location_name, address, city, state,
+                                     country, postal_code, latitude, longitude, case_id, notes, tags, project_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
+                   $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)`,
+          [tx.transaction_type, tx.item_label, tx.item_category,
+           tx.subject_asset_id ? (assetIdMapping[tx.subject_asset_id] || null) : null,
+           tx.subject_business_id ? (businessIdMapping[tx.subject_business_id] || null) : null,
+           tx.subject_property_id ? (propertyIdMapping[tx.subject_property_id] || null) : null,
+           tx.from_person_id ? (personIdMapping[tx.from_person_id] || null) : null,
+           tx.from_business_id ? (businessIdMapping[tx.from_business_id] || null) : null,
+           tx.from_external,
+           tx.to_person_id ? (personIdMapping[tx.to_person_id] || null) : null,
+           tx.to_business_id ? (businessIdMapping[tx.to_business_id] || null) : null,
+           tx.to_external, tx.value, tx.currency, tx.occurred_on,
+           tx.location_business_id ? (businessIdMapping[tx.location_business_id] || null) : null,
+           tx.location_property_id ? (propertyIdMapping[tx.location_property_id] || null) : null,
+           tx.location_name, tx.address, tx.city, tx.state, tx.country, tx.postal_code,
+           tx.latitude, tx.longitude, remapCase(tx), tx.notes, tx.tags || [], importProjectId]
+        ));
+      }
+    }
+
+    if (importData.data.wirelessNetworks) {
+      for (const net of importData.data.wirelessNetworks) {
+        await tryInsert(`wirelessNetwork:${net.ssid || net.bssid}`, () => client.query(
+          `INSERT INTO wireless_networks (ssid, bssid, latitude, longitude, accuracy, encryption,
+                                          signal_strength, frequency, channel, network_type,
+                                          confidence_level, first_seen, last_seen, scan_date,
+                                          person_id, association_note, association_confidence,
+                                          import_source, notes, tags, area_name, password,
+                                          associated_person_ids, associated_business_ids, project_id)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
+                   $19, $20, $21, $22, $23, $24, $25)`,
+          [net.ssid, net.bssid, net.latitude, net.longitude, net.accuracy, net.encryption,
+           net.signal_strength, net.frequency, net.channel, net.network_type, net.confidence_level,
+           net.first_seen, net.last_seen, net.scan_date,
+           net.person_id ? (personIdMapping[net.person_id] || null) : null,
+           net.association_note, net.association_confidence, net.import_source, net.notes,
+           net.tags || [], net.area_name, net.password,
+           (net.associated_person_ids || []).map(id => personIdMapping[id] || id),
+           (net.associated_business_ids || []).map(id => businessIdMapping[id] || id),
+           importProjectId]
+        ));
+      }
+    }
+
+    // Saved integration records (issue #96, export 1.4). Values taken from a
+    // record point at it by id in their finding (source.record_id), so those
+    // ids are rewritten to the new records afterwards.
+    if (importData.data.osintRecords) {
+      const { recordHash, recordProblem } = require('./utils/osintRecords');
+      const recordIdMapping = {};
+      for (const rec of importData.data.osintRecords) {
+        const personId = personIdMapping[rec.person_id];
+        if (!personId || recordProblem(rec.data)) continue;
+        await tryInsert(`osintRecord:${rec.id}`, async () => {
+          const { rows } = await client.query(
+            `INSERT INTO osint_records (person_id, data, data_hash, record_source, occurrences, tool_name,
+                                        integration_id, operation, query, retrieved_at, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE($11, CURRENT_TIMESTAMP))
+             ON CONFLICT ON CONSTRAINT osint_records_unique DO UPDATE SET retrieved_at = EXCLUDED.retrieved_at
+             RETURNING id`,
+            [personId, JSON.stringify(rec.data), recordHash(rec.data), rec.record_source || null, rec.occurrences || 1,
+              rec.tool_name || null, rec.integration_id || '', rec.operation || null, rec.query ?? null,
+              rec.retrieved_at || null, rec.created_at || null]
+          );
+          recordIdMapping[rec.id] = rows[0].id;
+        });
+      }
+      for (const person of importData.data.people || []) {
+        const newPersonId = personIdMapping[person.id];
+        const osint = Array.isArray(person.osint_data) ? person.osint_data : [];
+        if (!newPersonId || !osint.some((e) => (e.sources || []).some((src) => src.record_id))) continue;
+        const remap = (src) => (src && src.record_id
+          ? { ...src, record_id: recordIdMapping[src.record_id] || undefined }
+          : src);
+        const rewritten = osint.map((e) => ({ ...e, ...(e.source ? { source: remap(e.source) } : {}), ...(e.sources ? { sources: e.sources.map(remap) } : {}) }));
+        await tryInsert(`osintRecordLinks:${newPersonId}`, () => client.query(
+          'UPDATE people SET osint_data = $1::jsonb WHERE id = $2', [JSON.stringify(rewritten), newPersonId]
+        ));
+      }
+    }
+
+    // owner_business_id is a self-reference, so it can only be resolved once
+    // every business exists (issue #65).
+    if (importData.data.businesses) {
+      for (const business of importData.data.businesses) {
+        const newId = businessIdMapping[business.id];
+        const newOwnerId = business.owner_business_id ? businessIdMapping[business.owner_business_id] : null;
+        if (newId && newOwnerId) {
+          await tryInsert(`businessOwner:${business.name}`, () => client.query(
+            'UPDATE businesses SET owner_business_id = $1 WHERE id = $2', [newOwnerId, newId]
+          ));
+        }
+      }
+    }
+
+    await client.query('COMMIT');
+
+    // Remap connections onto the new person IDs and write them into
+    // relationships (issue #83 -- connections is a computed field over that
+    // table now, so writing the JSONB column here would be silently
+    // ignored on every subsequent read). Done after COMMIT: syncPersonConnections
+    // writes through the shared pool, not this transaction's client, so it
+    // needs the imported people to actually exist first.
     if (importData.data.people) {
       for (const person of importData.data.people) {
         if (person.connections && person.connections.length > 0) {
           const newPersonId = personIdMapping[person.id];
           if (newPersonId) {
-            // Update connections with new IDs
-            const updatedConnections = person.connections.map(conn => ({
-              ...conn,
-              person_id: personIdMapping[conn.person_id] || conn.person_id
-            }));
-            
-            await client.query(
-              `UPDATE people SET connections = $1::jsonb WHERE id = $2`,
-              [JSON.stringify(updatedConnections), newPersonId]
-            );
+            const remappedConnections = person.connections
+              .filter(conn => conn && conn.person_id != null)
+              .map(conn => ({
+                ...conn,
+                person_id: personIdMapping[conn.person_id] || conn.person_id,
+              }));
+            try {
+              await syncPersonConnections(newPersonId, importProjectId, null, remappedConnections);
+            } catch (err) {
+              console.warn('Import warning: connections for person', person.id, err.message);
+              importErrors.push({ record: `connections:person${person.id}`, error: err.message });
+            }
           }
         }
       }
     }
-    
-    await client.query('COMMIT');
+
     if (importErrors.length > 0) {
       // 207 Multi-Status: transaction committed but some records were skipped (issue #37)
       return res.status(207).json({

@@ -1,13 +1,109 @@
 const express = require('express');
 const router = express.Router();
 const { pool } = require('../config/database');
+const {
+  PROVIDERS, PROVIDER_IDS, DEFAULT_PROVIDER, isValidProvider, apiKeySettingKey,
+} = require('../services/geocodingProviders');
 const { requireAuth, requireAdmin } = require('../middleware/auth');
 const { validateIdParam } = require('../middleware/validation');
+const {
+  validate,
+  SettingsCustomFieldCreateSchema,
+  SettingsCustomFieldUpdateSchema,
+  SettingsGeocodingUpdateSchema,
+  SettingsUpdateCheckSchema,
+  SettingsBrandingUpdateSchema,
+  SettingsProjectRetentionSchema,
+  SettingsModelOptionCreateSchema,
+  SettingsModelOptionUpdateSchema,
+  SettingsToolsSchema,
+  SettingsModulesSchema,
+  SettingsSecuritySchema,
+} = require('../middleware/schemas');
+const { ALLOW_USER_TOOLS_KEY, allowUserTools } = require('../utils/toolAccess');
+const { SWITCHABLE_MODULES, DISABLED_MODULES_KEY, readDisabledModules } = require('../utils/modules');
+const { MFA_REQUIRED_KEY, mfaRequiredByPolicy, setMfaRequired, mfaState } = require('../services/accountSecurity');
+const { readOidcConfig } = require('../utils/oidcConfig');
+const { apiLimiter } = require('../middleware/rateLimiters');
+
+
+router.use(apiLimiter);
+
+// ── Branding + global defaults (issue #91) ───────────────────────────────────
+// App name/logo and the system-wide default language/theme, stored in
+// app_settings so every user/device sees the same values instead of each
+// browser's localStorage having its own copy. Read is intentionally NOT
+// gated behind requireAuth — the login screen and the first paint of the
+// app (before we know who's logged in, or whether anyone is) both need the
+// app's name/logo/default language/theme to render correctly. None of these
+// four values are sensitive; API keys and other credentials stay on the
+// admin-only routes below and are never included here.
+//
+// A per-user override (auth.js /me: language, theme_mode) takes precedence
+// over these defaults when one is set — see the cascade comment there.
+const BRANDING_KEYS = {
+  appName: 'app_name',
+  appLogo: 'app_logo',
+  defaultLanguage: 'default_language',
+  defaultThemeMode: 'default_theme_mode',
+  defaultTheme: 'default_theme',
+};
+
+const readBrandingSettings = async () => {
+  const result = await pool.query(
+    `SELECT key, value FROM app_settings WHERE key = ANY($1)`,
+    [Object.values(BRANDING_KEYS)]
+  );
+  const map = Object.fromEntries(result.rows.map((r) => [r.key, r.value]));
+  return {
+    appName: map[BRANDING_KEYS.appName] || 'OSINT Investigation CRM',
+    appLogo: map[BRANDING_KEYS.appLogo] || null,
+    defaultLanguage: map[BRANDING_KEYS.defaultLanguage] || 'en',
+    defaultThemeMode: map[BRANDING_KEYS.defaultThemeMode] || 'light',
+    // Colour theme for users who haven't picked one (Settings → Appearance).
+    defaultTheme: map[BRANDING_KEYS.defaultTheme] || 'ghost',
+  };
+};
+
+router.get('/branding', async (req, res) => {
+  try {
+    res.json(await readBrandingSettings());
+  } catch (err) {
+    console.error('Error fetching branding settings:', err);
+    res.status(500).json({ error: 'Failed to fetch branding settings' });
+  }
+});
+
+router.put('/branding', requireAdmin, validate(SettingsBrandingUpdateSchema), async (req, res) => {
+  const { appName, appLogo, defaultLanguage, defaultThemeMode, defaultTheme } = req.body;
+  const upsert = (key, value) => pool.query(
+    `INSERT INTO app_settings (key, value, updated_at) VALUES ($1, $2, CURRENT_TIMESTAMP)
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP`,
+    [key, value]
+  );
+
+  try {
+    if (appName !== undefined) await upsert(BRANDING_KEYS.appName, appName);
+    if (appLogo !== undefined) await upsert(BRANDING_KEYS.appLogo, appLogo);
+    if (defaultLanguage !== undefined) await upsert(BRANDING_KEYS.defaultLanguage, defaultLanguage);
+    if (defaultThemeMode !== undefined) await upsert(BRANDING_KEYS.defaultThemeMode, defaultThemeMode);
+    if (defaultTheme !== undefined) await upsert(BRANDING_KEYS.defaultTheme, defaultTheme);
+
+    res.json(await readBrandingSettings());
+  } catch (err) {
+    console.error('Error saving branding settings:', err);
+    res.status(500).json({ error: 'Failed to save branding settings' });
+  }
+});
 
 // Custom fields
-router.get('/custom-fields', requireAdmin, async (req, res) => {
+// Reading the definitions is requireAuth, not requireAdmin: every user needs
+// them to render custom fields on person profiles, and the frontend fetches
+// them at startup — admin-gating locked regular users out (issue #58).
+// Creating/editing/deleting definitions stays admin-only.
+router.get('/custom-fields', requireAuth, async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM custom_person_fields ORDER BY field_label ASC');
+    const result = await pool.query('SELECT * FROM custom_person_fields ORDER BY field_label ASC, id ASC');
     res.json(result.rows);
   } catch (err) {
     console.error('Error fetching custom fields definitions:', err.message, err.stack);
@@ -15,14 +111,8 @@ router.get('/custom-fields', requireAdmin, async (req, res) => {
   }
 });
 
-router.post('/custom-fields', requireAdmin, async (req, res) => {
+router.post('/custom-fields', requireAdmin, validate(SettingsCustomFieldCreateSchema), async (req, res) => {
   const { field_name, field_label, field_type, options, is_active } = req.body;
-  if (!field_name || !field_label || !field_type) {
-    return res.status(400).json({ error: 'field_name, field_label, and field_type are required' });
-  }
-  if (!/^[a-zA-Z0-9_]+$/.test(field_name)) {
-    return res.status(400).json({ error: 'field_name can only contain alphanumeric characters and underscores.' });
-  }
 
   const query = `INSERT INTO custom_person_fields (field_name, field_label, field_type, options, is_active) VALUES ($1, $2, $3, $4, $5) RETURNING *;`;
   const values = [field_name, field_label, field_type, JSON.stringify(options || []), is_active !== undefined ? is_active : true];
@@ -39,12 +129,9 @@ router.post('/custom-fields', requireAdmin, async (req, res) => {
   }
 });
 
-router.put('/custom-fields/:id', requireAdmin, validateIdParam, async (req, res) => {
+router.put('/custom-fields/:id', requireAdmin, validateIdParam, validate(SettingsCustomFieldUpdateSchema), async (req, res) => {
   const fieldId = req.params.id;
   const { field_label, field_type, options, is_active } = req.body;
-  if (!field_label || !field_type) {
-    return res.status(400).json({ error: 'field_label and field_type are required for update' });
-  }
 
   const query = `UPDATE custom_person_fields SET field_label = $1, field_type = $2, options = $3, is_active = $4 WHERE id = $5 RETURNING *;`;
   const values = [field_label, field_type, JSON.stringify(options || []), is_active !== undefined ? is_active : true, fieldId];
@@ -72,10 +159,252 @@ router.delete('/custom-fields/:id', requireAdmin, validateIdParam, async (req, r
   }
 });
 
+// ── Update check ─────────────────────────────────────────────────────────────
+// On by default so operators hear about fixes, but fully switchable off for
+// deployments that must make no outbound connections at all. When disabled the
+// server makes no request — it isn't just hidden in the UI.
+router.get('/updates', requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(`SELECT value FROM app_settings WHERE key = 'update_check_enabled'`);
+    const enabled = result.rows.length === 0 ? true : result.rows[0].value !== 'false';
+    res.json({ updateCheckEnabled: enabled });
+  } catch (err) {
+    console.error('Error fetching update settings:', err);
+    res.status(500).json({ error: 'Failed to fetch update settings' });
+  }
+});
+
+router.put('/updates', requireAdmin, validate(SettingsUpdateCheckSchema), async (req, res) => {
+  const { updateCheckEnabled } = req.body;
+  try {
+    await pool.query(
+      `INSERT INTO app_settings (key, value, updated_at) VALUES ('update_check_enabled', $1, CURRENT_TIMESTAMP)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP`,
+      [updateCheckEnabled ? 'true' : 'false']
+    );
+    res.json({ updateCheckEnabled: Boolean(updateCheckEnabled) });
+  } catch (err) {
+    console.error('Error saving update settings:', err);
+    res.status(500).json({ error: 'Failed to save update settings' });
+  }
+});
+
+// ── Archived-project retention (issue #88) ───────────────────────────────────
+// How many days a project may stay in 'closed' status before the retention
+// scheduler permanently deletes it and all its data. 0 = never (default).
+// Admin-only, read only by the Settings page — never during startup.
+const PROJECT_RETENTION_KEY = 'archived_project_retention_days';
+
+router.get('/project-retention', requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(`SELECT value FROM app_settings WHERE key = $1`, [PROJECT_RETENTION_KEY]);
+    const retentionDays = result.rows.length === 0 ? 0 : parseInt(result.rows[0].value, 10) || 0;
+    res.json({ retentionDays });
+  } catch (err) {
+    console.error('Error fetching project retention setting:', err);
+    res.status(500).json({ error: 'Failed to fetch project retention setting' });
+  }
+});
+
+// ── OSINT tools policy (issue #96) ───────────────────────────────────────────
+// Readable by everyone (the Tools page needs to know whether to offer "Add"),
+// changeable by admins.
+router.get('/tools', requireAuth, async (req, res) => {
+  try {
+    res.json({ allow_user_tools: await allowUserTools(pool) });
+  } catch (err) {
+    console.error('Error fetching tools policy:', err);
+    res.status(500).json({ error: 'Failed to fetch tools settings' });
+  }
+});
+
+router.put('/tools', requireAdmin, validate(SettingsToolsSchema), async (req, res) => {
+  const { allow_user_tools } = req.body;
+  try {
+    await pool.query(
+      `INSERT INTO app_settings (key, value, updated_at) VALUES ($1, $2, CURRENT_TIMESTAMP)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP`,
+      [ALLOW_USER_TOOLS_KEY, String(allow_user_tools)]
+    );
+    await req.audit.log('settings', 0, 'update', ALLOW_USER_TOOLS_KEY, null, String(allow_user_tools));
+    res.json({ allow_user_tools });
+  } catch (err) {
+    console.error('Error saving tools policy:', err);
+    res.status(500).json({ error: 'Failed to save tools settings' });
+  }
+});
+
+// ── Modules ───────────────────────────────────────────────────────────────────
+// Which sections the interface shows. Readable by every signed-in user (the
+// menu is built from it), changeable by admins. Display only: switching a
+// module off hides it, its data and API stay.
+router.get('/modules', requireAuth, async (req, res) => {
+  try {
+    res.json({ available: SWITCHABLE_MODULES, disabled: await readDisabledModules(pool) });
+  } catch (err) {
+    console.error('Error fetching modules:', err);
+    res.status(500).json({ error: 'Failed to fetch modules' });
+  }
+});
+
+router.put('/modules', requireAdmin, validate(SettingsModulesSchema), async (req, res) => {
+  const disabled = SWITCHABLE_MODULES.filter((id) => req.body.disabled.includes(id));
+  try {
+    const before = await readDisabledModules(pool);
+    await pool.query(
+      `INSERT INTO app_settings (key, value, updated_at) VALUES ($1, $2, CURRENT_TIMESTAMP)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP`,
+      [DISABLED_MODULES_KEY, JSON.stringify(disabled)]
+    );
+    await req.audit.log('settings', 0, 'update', DISABLED_MODULES_KEY, before.join(', ') || 'none', disabled.join(', ') || 'none');
+    res.json({ available: SWITCHABLE_MODULES, disabled });
+  } catch (err) {
+    console.error('Error saving modules:', err);
+    res.status(500).json({ error: 'Failed to save modules' });
+  }
+});
+
+// ── Sign-in security (issue #90) ─────────────────────────────────────────────
+// "Require two-factor": users without it are held at the setup screen from
+// their next sign-in. The admin turning it on must have two-factor already,
+// so the setting can't take effect on them by surprise.
+//
+// It applies to sign-ins with a GHOST password only: single sign-on leaves
+// two-step verification to the identity provider (#105). So an admin signed
+// in through single sign-on can turn it on without setting up GHOST's own,
+// and with password sign-in off it has no effect at all (#108).
+const canRequireMfa = async (req) => Boolean(req.session.sso) || (await mfaState(pool, req.session.userId)).enabled;
+router.get('/security', requireAdmin, async (req, res) => {
+  try {
+    res.json({
+      mfa_required: await mfaRequiredByPolicy(pool),
+      can_require: await canRequireMfa(req),
+      local_login: readOidcConfig().localLoginEnabled,
+    });
+  } catch (err) {
+    console.error('Error fetching security settings:', err);
+    res.status(500).json({ error: 'Failed to fetch security settings' });
+  }
+});
+
+router.put('/security', requireAdmin, validate(SettingsSecuritySchema), async (req, res) => {
+  const { mfa_required } = req.body;
+  try {
+    if (mfa_required && !(await canRequireMfa(req))) {
+      return res.status(400).json({
+        error: 'Set up two-factor authentication for your own account first.',
+        code: 'mfa_not_enabled',
+      });
+    }
+    await setMfaRequired(pool, mfa_required);
+    await req.audit.log('settings', 0, 'update', MFA_REQUIRED_KEY, null, String(mfa_required));
+    res.json({ mfa_required });
+  } catch (err) {
+    console.error('Error saving security settings:', err);
+    res.status(500).json({ error: 'Failed to save security settings' });
+  }
+});
+
+router.put('/project-retention', requireAdmin, validate(SettingsProjectRetentionSchema), async (req, res) => {
+  const { retentionDays } = req.body;
+  try {
+    await pool.query(
+      `INSERT INTO app_settings (key, value, updated_at) VALUES ($1, $2, CURRENT_TIMESTAMP)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP`,
+      [PROJECT_RETENTION_KEY, String(retentionDays)]
+    );
+    res.json({ retentionDays });
+  } catch (err) {
+    console.error('Error saving project retention setting:', err);
+    res.status(500).json({ error: 'Failed to save project retention setting' });
+  }
+});
+
+// ── Geocoding provider ───────────────────────────────────────────────────────
+// Admin-only, and only ever read by the Settings page — never during startup,
+// so it can't reproduce the "System Offline" 403 problem from issue #58.
+//
+// API keys are WRITE-ONLY. The response reports whether one is stored, never
+// its value: an operator's paid API key should not be recoverable by anyone who
+// can open the settings screen or read a browser network log.
+//
+// The provider list comes from the registry, so adding a provider needs no
+// change here.
+const readGeocodingSettings = async () => {
+  const keyNames = PROVIDER_IDS.map(apiKeySettingKey);
+  const result = await pool.query(
+    `SELECT key, value FROM app_settings WHERE key = 'geocoding_provider' OR key = ANY($1)`,
+    [keyNames]
+  );
+  const map = Object.fromEntries(result.rows.map((r) => [r.key, r.value]));
+  const provider = isValidProvider(map.geocoding_provider) ? map.geocoding_provider : DEFAULT_PROVIDER;
+  return {
+    map,
+    payload: {
+      provider,
+      providers: PROVIDER_IDS.map((id) => ({
+        id,
+        requiresKey: PROVIDERS[id].requiresKey,
+        hasApiKey: Boolean(map[apiKeySettingKey(id)]),
+      })),
+    },
+  };
+};
+
+router.get('/geocoding', requireAdmin, async (req, res) => {
+  try {
+    const { payload } = await readGeocodingSettings();
+    res.json(payload);
+  } catch (err) {
+    console.error('Error fetching geocoding settings:', err);
+    res.status(500).json({ error: 'Failed to fetch geocoding settings' });
+  }
+});
+
+router.put('/geocoding', requireAdmin, validate(SettingsGeocodingUpdateSchema), async (req, res) => {
+  const { provider, apiKeys } = req.body;
+
+  try {
+    const upsert = (key, value) => pool.query(
+      `INSERT INTO app_settings (key, value, updated_at) VALUES ($1, $2, CURRENT_TIMESTAMP)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP`,
+      [key, value]
+    );
+
+    if (provider !== undefined) await upsert('geocoding_provider', provider);
+
+    // Per provider: absent = leave the stored key alone (the form never echoes
+    // a key back), '' = clear it.
+    for (const id of PROVIDER_IDS) {
+      const supplied = apiKeys?.[id];
+      if (supplied === undefined) continue;
+      const trimmed = String(supplied).trim();
+      if (trimmed === '') await pool.query('DELETE FROM app_settings WHERE key = $1', [apiKeySettingKey(id)]);
+      else await upsert(apiKeySettingKey(id), trimmed);
+    }
+
+    // Apply immediately rather than after the config cache expires.
+    req.app.locals.improvedGeocodingService?.invalidateProviderConfig?.();
+
+    const { map, payload } = await readGeocodingSettings();
+    res.json({
+      ...payload,
+      // A provider that needs a key but has none falls back rather than
+      // failing every lookup — surface that so it isn't silent.
+      warning: PROVIDERS[payload.provider].requiresKey && !map[apiKeySettingKey(payload.provider)]
+        ? 'no_api_key'
+        : undefined,
+    });
+  } catch (err) {
+    console.error('Error saving geocoding settings:', err);
+    res.status(500).json({ error: 'Failed to save geocoding settings' });
+  }
+});
+
 // Model options
 router.get('/model-options', requireAuth, async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM model_options ORDER BY model_type, display_order ASC');
+    const result = await pool.query('SELECT * FROM model_options ORDER BY model_type, display_order ASC, id ASC');
     res.json(result.rows);
   } catch (err) {
     console.error('Error fetching model options:', err);
@@ -83,12 +412,8 @@ router.get('/model-options', requireAuth, async (req, res) => {
   }
 });
 
-router.post('/model-options', requireAdmin, async (req, res) => {
+router.post('/model-options', requireAdmin, validate(SettingsModelOptionCreateSchema), async (req, res) => {
   const { model_type, option_value, option_label, display_order } = req.body;
-
-  if (!model_type || !option_value || !option_label) {
-    return res.status(400).json({ error: 'model_type, option_value, and option_label are required' });
-  }
 
   try {
     const result = await pool.query(
@@ -106,7 +431,7 @@ router.post('/model-options', requireAdmin, async (req, res) => {
   }
 });
 
-router.put('/model-options/:id', requireAdmin, validateIdParam, async (req, res) => {
+router.put('/model-options/:id', requireAdmin, validateIdParam, validate(SettingsModelOptionUpdateSchema), async (req, res) => {
   const optionId = req.params.id;
   const { option_label, is_active, display_order } = req.body;
 

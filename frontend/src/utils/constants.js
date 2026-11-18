@@ -17,6 +17,23 @@ export const PERSON_CATEGORIES = [
     { value: 'Closed', label: 'Closed', color: 'gray' },
     { value: 'On Hold', label: 'On Hold', color: 'blue' },
   ];
+
+  // Crypto wallet networks / tags (issue #82) -- fallback for useModelOptions
+  // when the DB fetch fails or seedDefaults hasn't run yet.
+  export const CRYPTO_WALLET_NETWORKS = [
+    { value: 'bitcoin', label: 'Bitcoin' },
+    { value: 'ethereum', label: 'Ethereum' },
+    { value: 'solana', label: 'Solana' },
+    { value: 'tron', label: 'Tron' },
+    { value: 'other', label: 'Other' },
+  ];
+
+  export const CRYPTO_WALLET_TAGS = [
+    { value: 'suspicious', label: 'Suspicious' },
+    { value: 'exchange', label: 'Exchange' },
+    { value: 'mixer', label: 'Mixer' },
+    { value: 'scam', label: 'Scam' },
+  ];
   
   // CRM Statuses - DYNAMIC (will be loaded from database)
   export let CRM_STATUSES = [
@@ -50,7 +67,8 @@ export const PERSON_CATEGORIES = [
     { value: 'family', label: 'Family' },
     { value: 'friend', label: 'Friend' },
     { value: 'enemy', label: 'Enemy' },
-    { value: 'employer', label: 'Employer/Employee' },
+    { value: 'employer', label: 'Employer' },
+    { value: 'employee', label: 'Employee' },
     { value: 'suspect', label: 'Suspect Connection' },
     { value: 'witness', label: 'Witness' },
     { value: 'victim', label: 'Victim' },

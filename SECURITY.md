@@ -13,7 +13,32 @@ Please include:
 - Steps to reproduce
 - Any proof-of-concept code (if applicable)
 
-We aim to respond within 48 hours and will keep you informed of progress toward a fix.
+GHOST is maintained by one person, so reports are handled on a best-effort
+basis: expect a first reply within a few days. You'll be kept informed of
+progress toward a fix.
+
+### Disclosure
+
+- Please give us **90 days** from your report to release a fix before you
+  disclose details publicly. If a fix ships sooner, we'll agree a disclosure
+  date with you; if more time is needed, we'll explain why and agree an
+  extension.
+- Fixed vulnerabilities are published as GitHub Security Advisories, and
+  reporters are credited unless they prefer not to be.
+- We won't take action against anyone who researches and reports in good
+  faith: test only against your own installation, don't access or alter
+  other people's data, and don't degrade service for others.
+
+### Scope
+
+**In scope:** the GHOST backend, frontend, MCP server (`mcp/`), Docker
+images and compose files in this repository.
+
+**Out of scope:** community integrations under `integrations/` that are
+maintained by others, third-party services GHOST connects to (geocoding
+providers, OSINT tools, identity providers), and problems that come only
+from how an operator has deployed GHOST (e.g. no HTTPS, a weak
+`SESSION_SECRET`, an exposed database port).
 
 ---
 
@@ -21,13 +46,16 @@ We aim to respond within 48 hours and will keep you informed of progress toward 
 
 | Version | Supported |
 |---------|-----------|
-| 2.5.x   | ✅ Active |
-| 2.4.x   | ✅ Security patches only |
-| < 2.4   | ❌ No longer supported |
+| 3.2.x (latest release) | ✅ Active |
+| 3.0 – 3.1 | ❌ Fixes ship in the latest release only — upgrade |
+| 2.x     | ❌ No longer supported — see the [3.0 upgrade notes](README.md#upgrading-to-30) |
+
+Database migrations run automatically at startup, so upgrading is a matter of
+replacing the images.
 
 ---
 
-## Security Architecture (v2.5.0)
+## Security Architecture
 
 ### Authentication & Sessions
 - ✅ Session-based authentication via `express-session` with `connect-pg-simple` (sessions stored in PostgreSQL)
@@ -35,44 +63,87 @@ We aim to respond within 48 hours and will keep you informed of progress toward 
 - ✅ Session revoked immediately on password change, role change, deactivation, or account deletion
 - ✅ `requireAdmin` middleware performs a live database lookup on every admin request — stale sessions rejected in real time
 - ✅ Session cookies: `HttpOnly`, `SameSite=Strict`; `secure: true` enabled automatically when `NODE_ENV=production`
+- ✅ Sessions expire after 30 days
+- ✅ Optional two-step verification (v2.26): authenticator app (TOTP, RFC 6238) and passkeys (WebAuthn), with one-time recovery codes. After the password the session holds only a pending marker, not a user, until the second step passes. App secrets are encrypted at rest (AES-256-GCM, key from `SECRETS_KEY`/`SESSION_SECRET`); each code is accepted once; recovery codes and API tokens are stored as SHA-256 hashes
+- ✅ Admins can require two-step verification for everyone; users without it can reach only the setup screen
+- ✅ Optional single sign-on (OpenID Connect, v3.1.2): authorization code flow with PKCE; the provider must name exactly the configured issuer. Sign-out at the provider ends the GHOST session through back-channel logout, or otherwise within `OIDC_SESSION_CHECK_MINUTES` (default 5). New accounts are created only with `OIDC_AUTO_PROVISION` on, and the admin role can follow an `OIDC_ADMIN_GROUP`
+- ✅ Personal API tokens (`Authorization: Bearer ghost_…`) act as their owner with the owner's current role, are refused for deactivated accounts, and cannot change passwords, security settings or create tokens
+
+### Authorisation
+- ✅ Two global roles (`admin`, `user`) plus a per-project role (`owner`, `manager`, `investigator`) held on the membership
+- ✅ Membership changes are rank-checked server-side: a non-admin can only act on members ranked below them, only grant roles below their own, and never change their own membership; only admins appoint or remove owners
+- ✅ Projects are an isolation boundary: non-admins can read and write only the projects they are members of, enforced on every project-scoped API route — list endpoints are constrained to the caller's memberships even when no project is requested
+- ✅ Project membership is checked with a live query on every request, so removing a member takes effect immediately
+- ✅ Linking records across projects is off unless enabled per project
 
 ### Password Policy
 - ✅ Minimum 12 characters
 - ✅ Must contain at least one uppercase letter, one lowercase letter, and one digit
-- ✅ Common/weak passwords rejected via a blocklist (100+ entries)
+- ✅ Common passwords rejected via a short blocklist (30 entries)
 - ✅ Password must not contain the user's username
 - ✅ Maximum 128 characters (bcrypt pre-hash protection)
-- ✅ Policy enforced at every password-setting point: login, change, admin create, admin reset
+- ✅ Policy enforced at every point a password is set: password change, admin create, admin reset, and the command-line scripts (`createAdminSimple.js`, `resetPassword.js`), which read the password at a hidden prompt rather than from the command line
+- ✅ A password reset from the command line signs the account out everywhere
 
 ### Rate Limiting
-- ✅ Login: 10 attempts per 15 minutes per IP + username combination
-- ✅ Password change: 5 attempts per hour
+- ✅ Login: 10 attempts per 15 minutes per IP + username combination (tunable via `LOGIN_RATE_LIMIT_MAX`, `LOGIN_RATE_LIMIT_WINDOW_MS`, `LOGIN_RATE_LIMIT_DISABLE`)
+- ✅ Second sign-in step: 10 attempts per 15 minutes per account; five wrong codes in a row require the password again
+- ✅ Integrated OSINT tool searches: 30 per minute per client
 - ✅ Geocoding endpoints: 60 requests per minute per IP
-- ⚠️ **Multi-instance note**: limiters use in-process memory. For multi-replica deployments configure a shared store (Redis or PostgreSQL) in `backend/middleware/rateLimiters.js`
+- ✅ General API limiter: 300 requests per minute per IP on all authenticated data routes (this also covers password changes, which need the current password)
+- ✅ IPv6 clients are counted per /56 block, so rotating through an ISP-assigned range doesn't buy more attempts (v2.27)
+- ✅ Login, second-step and tool-search counts are stored in PostgreSQL (v2.27): a restart doesn't reset them, and several backend instances share them. The general API and geocoding limiters stay in memory, per instance
+- ✅ The client address comes from `X-Forwarded-For`, trusting one proxy hop (nginx). The backend's own port (3001) is published on localhost only (v2.27), since a client reaching it directly could set that header itself. `BACKEND_BIND=0.0.0.0` publishes it anyway; then put it behind your proxy too
 
 ### Input Validation & Sanitisation
 - ✅ All `/:id` route parameters validated as positive integers via `validateIdParam` middleware
-- ✅ String inputs stripped of `<script>`, `<iframe>`, and inline event handlers before storage
+- ✅ Stored text is rendered through React, which escapes it on output — input is not rewritten or stripped on the way in
 - ✅ SQL injection prevented — all queries use parameterised statements (no string concatenation)
-- ✅ Email, URL, and date formats validated at API boundaries
-- ✅ Person, tool, and business data validated via dedicated middleware before DB writes
+- ✅ Field formats (URLs, emails, ids, enums, lengths) validated by the Zod schemas where a field has one
+- ✅ Every POST/PUT request body validated against a Zod schema (`backend/middleware/schemas.js`); unknown fields stripped, structured field-level errors returned
+- ✅ Schema↔route consistency enforced by a static test (`schemaRouteConsistency.test.js`) — every body field a route reads must be declared in its schema
+- ✅ The backend test suite runs in CI on every push and pull request
+- ✅ Raw database error messages suppressed in responses when `NODE_ENV=production`
 
 ### Geocoding Endpoints
-- ✅ `/api/geocode/suggestions`, `/api/geocode/address`, `/api/geocode/stats` require authentication
-- ✅ Nominatim requests rate-limited and cached in the database to minimise external calls
+- ✅ All `/api/geocode/*` endpoints require authentication; batch geocoding is admin-only
+- ✅ Requests to the configured provider (Nominatim by default; Yandex or LocationIQ optionally) are rate-limited and cached in the database to minimise external calls
+- ✅ Provider API keys are write-only: the settings API reports whether a key is stored, never its value
 - ✅ 8-second timeout on all outbound geocoding requests
 
+### API Reference & Outbound Connections
+- ✅ `/api/docs` (Swagger UI) and `/api/openapi.json` are available to signed-in users only; requests sent from the page use the caller's own session, role and project memberships. `API_DOCS_ENABLED=false` removes the page
+- ✅ Swagger UI is served from the backend image — no CDN is contacted
+- ✅ The update check is the only connection GHOST makes on its own besides geocoding; it can be disabled in Settings → General, after which no request is made
+- ⚠️ The MCP server (`mcp/`) can read and change investigation data with the full permissions of the account it uses. Give it a dedicated non-admin account that is a member of only the projects it needs, and connect with a personal API token (`GHOST_API_TOKEN`) that you can revoke under Settings → Security. Username and password still work for accounts without two-step verification, but a token is preferred
+
 ### File Uploads
+- ✅ File attachments (evidence on people and projects): up to 50 MB by default (`FILES_MAX_BYTES`), visible only to project members; deleting is limited to the uploader, the project's owners and managers, or an admin
+- ✅ Attachments are only ever served as downloads (`application/octet-stream`, `Content-Disposition: attachment`, `nosniff`, a sandbox CSP), so an uploaded HTML or SVG file never runs on GHOST's origin
+- ✅ Each attachment's SHA-256 is recorded, and uploads, downloads, changes and deletions are written to the audit log
 - ✅ Logo uploads restricted to `image/jpeg`, `image/png`, `image/gif` — SVG rejected
-- ✅ Upload size capped at 5 MB by default; override with `KML_MAX_BYTES` environment variable
-- ✅ KML imports: oversized uploads return `413 Payload Too Large`
-- ⚠️ No virus/malware scanning — consider adding ClamAV for high-security deployments
+- ✅ Logo uploads capped at 5 MB
+- ✅ KML imports capped at 5 MB by default (`KML_MAX_BYTES`); oversized uploads return `413 Payload Too Large`
+- ⚠️ No virus/malware scanning of attachments — treat downloaded evidence files as untrusted, and consider ClamAV for high-security deployments
 - ⚠️ Uploaded files are stored on the local filesystem — use object storage (S3/GCS) for production scale
 
+### Security Headers (v2.27)
+- ✅ Pages (nginx): `frame-ancestors 'none'` and `X-Frame-Options: DENY` (no clickjacking), `object-src`/`base-uri`/`form-action` locked down, `nosniff`, `Cross-Origin-Opener-Policy: same-origin`, a Permissions-Policy that allows only passkeys
+- ✅ `Referrer-Policy: no-referrer`: following a link out of GHOST doesn't tell the destination where GHOST runs. Map tiles alone send the origin, as OpenStreetMap's tile policy asks
+- ✅ HSTS is sent only when a proxy in front reports HTTPS (`X-Forwarded-Proto: https`), without `includeSubDomains`
+- ✅ API (helmet): `default-src 'none'` for JSON and files; the API docs page allows only its own scripts, pinned by hash
+- ✅ nginx doesn't reveal its version
+- ✅ Pages: a strict Content-Security-Policy (v3.0). Only the app's own bundled scripts run (`script-src 'self'`, no inline script), and the page can only talk to its own server (`connect-src 'self'`), so injected markup can neither run code nor send data elsewhere. Images may come from `https:` (map tiles, linked profile pictures)
+- ✅ Leaflet's marker images ship with the app instead of loading from a CDN (v3.0)
+
 ### Docker & Infrastructure
+- ✅ Supported base images: Node.js 26 LTS (security fixes until April 2029) and nginx 1.30 stable (v2.27)
 - ✅ Backend container runs as non-root user (`nodejs:1001`)
 - ✅ PostgreSQL not exposed to host network by default in `docker-compose.yml`
-- ✅ `docker-compose.override.yml` exposes port 5432 for local development only
+- ✅ Exposing port 5432 to the host takes a deliberate local `docker-compose.override.yml`, which is git-ignored and not shipped
+- ✅ Images are built and published by GitHub Actions; the repository is scanned with CodeQL
+- ✅ Dependabot proposes dependency updates weekly; CI fails on high or critical advisories in runtime dependencies (`npm audit --omit=dev`)
+- ✅ The backend image contains runtime dependencies only (`npm ci --omit=dev`)
 - ✅ Multi-stage frontend build — dev dependencies not present in the nginx image
 - ✅ `nginx.conf`: `index.html` served with `no-store` / `no-cache`; hashed JS/CSS served as `immutable`
 - ⚠️ Consider using Docker secrets or a secrets manager (Vault, AWS SSM) for `DB_PASSWORD` and `SESSION_SECRET` in production
@@ -95,21 +166,19 @@ We aim to respond within 48 hours and will keep you informed of progress toward 
 
 ### Database
 - [ ] Dedicated PostgreSQL user with minimum required privileges
-- [ ] Regular automated backups with tested restore procedure
+- [ ] Regular automated backups with tested restore procedure — use `pg_dump`; the in-app JSON export does not cover every table
 - [ ] SSL/TLS enabled for database connections
 
 ### Monitoring
 - [ ] Centralised log aggregation (e.g. ELK, CloudWatch, Loki)
 - [ ] Alerts on repeated login failures and 5xx error spikes
-- [ ] Regular review of audit log (`/api/audit`)
+- [ ] Regular review of the audit log (Settings → Audit Logs, or `/api/audit-logs`)
 
 ---
 
 ## Known npm Audit Findings
 
-The frontend uses `react-scripts` (Create React App), which carries several audit findings in its bundled webpack toolchain. **These affect the development server only** — they are not present in the production nginx build.
-
-Running `npm audit fix --force` will likely break the CRA build. The recommendation is to monitor for a CRA upgrade or migration to Vite/Next.js if this becomes a concern.
+Since v3.0 the frontend builds with Vite instead of Create React App, which removed the webpack toolchain and its audit findings. `npm audit --omit=dev` lists what ships to the browser; findings in development tools (ESLint, Vitest) don't reach the production build.
 
 ---
 

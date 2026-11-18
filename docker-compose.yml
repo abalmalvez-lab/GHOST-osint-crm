@@ -1,15 +1,29 @@
 # File: docker-compose.yml
 # This file defines how Docker should run your multi-container application.
+#
+# Images are published to GHCR on every release, so updating is:
+#
+#     docker compose pull && docker compose up -d
+#
+# — no local build, no toolchain, and it takes seconds. GHOST_VERSION pins a
+# specific release (e.g. GHOST_VERSION=2.12.1); the default tracks `latest`.
+#
+# The `build:` sections are kept so developers and anyone modifying the source
+# can still build locally with `docker compose up -d --build`.
 
 services:
   # Frontend Service (React App served by Nginx)
   frontend:
+    image: ghcr.io/elm1nst3r/ghost-osint-crm-frontend:${GHOST_VERSION:-latest}
     build:
       context: ./frontend
       dockerfile: Dockerfile
     container_name: osint-crm-frontend
     ports:
-      - "8080:80"
+      # All interfaces by default, so other machines on your network can reach
+      # GHOST. With a reverse proxy on the same host, set FRONTEND_BIND=127.0.0.1
+      # in .env so only the proxy (and HTTPS) faces the network.
+      - "${FRONTEND_BIND:-0.0.0.0}:8080:80"
     restart: unless-stopped
     depends_on:
       backend:
@@ -25,28 +39,66 @@ services:
 
   # Backend Service (Node.js/Express API)
   backend:
+    image: ghcr.io/elm1nst3r/ghost-osint-crm-backend:${GHOST_VERSION:-latest}
     build:
       context: ./backend
       dockerfile: Dockerfile
     container_name: osint-crm-backend
     ports:
-      - "3001:3001"
+      # Localhost only: the app (port 8080) reaches the backend over the
+      # Docker network, and nginx there sets the client address the rate
+      # limits use. Published on the network, port 3001 would let a client
+      # name its own address in X-Forwarded-For. Set BACKEND_BIND=0.0.0.0 in
+      # .env only if something on another machine must use it directly.
+      - "${BACKEND_BIND:-127.0.0.1}:3001:3001"
     environment:
-      NODE_ENV: production
+      NODE_ENV: ${NODE_ENV:-production}
       PORT: 3001
-      DB_HOST: db
+      # Lets the update dialog show the right commands for a pinned version.
+      GHOST_VERSION: ${GHOST_VERSION:-}
+      DB_HOST: ${DB_HOST:-db}
       DB_USER: ${DB_USER:-postgres}
       DB_PASSWORD: ${DB_PASSWORD}
       DB_NAME: ${DB_NAME:-osint_crm_db}
-      DB_PORT: 5432
+      DB_PORT: ${DB_PORT:-5432}
       SESSION_SECRET: ${SESSION_SECRET}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:8080}
+      # Proxies in front of the backend that may name the client's address
+      # (rate limits): 1 = the app's nginx; 2 behind one more reverse proxy.
+      TRUST_PROXY: ${TRUST_PROXY:-1}
+      PASSKEY_ORIGINS: ${PASSKEY_ORIGINS:-}
+      API_DOCS_ENABLED: ${API_DOCS_ENABLED:-true}
+      FILES_DIR: /usr/src/app/data/files
+      FILES_MAX_BYTES: ${FILES_MAX_BYTES:-52428800}
+      SECRETS_KEY: ${SECRETS_KEY:-}
+      INTEGRATIONS_ALLOW_PRIVATE: ${INTEGRATIONS_ALLOW_PRIVATE:-false}
+      # Single sign-on through OpenID Connect (issue #105): off unless set.
+      # See USER_MANAGEMENT.md → Single sign-on.
+      OIDC_ENABLED: ${OIDC_ENABLED:-false}
+      OIDC_ISSUER_URL: ${OIDC_ISSUER_URL:-}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
+      OIDC_REDIRECT_URI: ${OIDC_REDIRECT_URI:-}
+      OIDC_SCOPES: ${OIDC_SCOPES:-openid profile email}
+      OIDC_DISPLAY_NAME: ${OIDC_DISPLAY_NAME:-SSO}
+      OIDC_AUTO_PROVISION: ${OIDC_AUTO_PROVISION:-false}
+      OIDC_ADMIN_GROUP: ${OIDC_ADMIN_GROUP:-}
+      OIDC_GROUPS_CLAIM: ${OIDC_GROUPS_CLAIM:-groups}
+      OIDC_LOGOUT: ${OIDC_LOGOUT:-true}
+      OIDC_SESSION_CHECK_MINUTES: ${OIDC_SESSION_CHECK_MINUTES:-5}
+      OIDC_ALLOW_HTTP: ${OIDC_ALLOW_HTTP:-false}
+      LOCAL_LOGIN_ENABLED: ${LOCAL_LOGIN_ENABLED:-true}
 
     volumes:
       - ./backend/public:/usr/src/app/public
+      # Uploaded person/project files (issue #97). Back this up along with
+      # the database: a database dump does not contain the files.
+      - files_data:/usr/src/app/data/files
     restart: unless-stopped
     depends_on:
       db:
         condition: service_healthy
+        required: false
     networks:
       - osint-crm-network
     healthcheck:
@@ -58,6 +110,16 @@ services:
       start_period: 40s
 
   # Database Service (PostgreSQL)
+  #
+  # Pointing GHOST at your own PostgreSQL server instead? Set DB_HOST/DB_PORT
+  # (and DB_USER/DB_PASSWORD/DB_NAME) in .env to that server and add
+  # COMPOSE_FILE=docker-compose.yml:docker-compose.external-db.yml, which keeps
+  # this bundled container from starting. `required: false` on backend's
+  # depends_on above means backend won't wait on or fail over a db that was
+  # never started.
+  #
+  # 2.17.0-2.18.x put this service behind a `local-db` profile instead, which
+  # silently stopped the database for anyone whose .env predated it (#94).
   db:
     image: postgres:15-alpine
     container_name: osint-crm-db
@@ -84,3 +146,4 @@ networks:
 # Define a named volume for persistent PostgreSQL data
 volumes:
   postgres_data:
+  files_data:

@@ -1,0 +1,103 @@
+# GHOST MCP Server
+
+Exposes the GHOST OSINT CRM API as [Model Context Protocol](https://modelcontextprotocol.io) tools, so any MCP-compatible LLM client (Claude Desktop, Claude Code, etc.) can read and write GHOST data directly — search people, create transactions, pull ledgers, add travel history, and everything else the API offers.
+
+## How it works
+
+At startup the server logs into GHOST, fetches the API's own OpenAPI document (`GET /api/openapi.json`), and generates one MCP tool per endpoint — request schemas, required fields, enums and all. **There are no hand-maintained tool definitions**: whatever the running GHOST instance supports is what the LLM sees. Upgrading GHOST automatically upgrades the toolset.
+
+Tool names follow the pattern `ghost_<verb>_<resource>`:
+
+| Tool | Endpoint |
+|---|---|
+| `ghost_get_people` | `GET /api/people` |
+| `ghost_get_people_by_id` | `GET /api/people/{id}` |
+| `ghost_create_people` | `POST /api/people` |
+| `ghost_create_transactions` | `POST /api/transactions` |
+| `ghost_get_ledger` | `GET /api/{entityType}/{id}/ledger` |
+| `ghost_get_businesses_venue_stats` | `GET /api/businesses/{id}/venue-stats` |
+
+| `ghost_get_crypto_wallets` | `GET /api/crypto-wallets` |
+| `ghost_get_projects_members` | `GET /api/projects/{id}/members` |
+
+…and ~95 more. The [API catalogue](https://elm1nst3r.github.io/GHOST-osint-crm/) lists every endpoint with the tool it becomes; your own instance serves an interactive version at `/api/docs`.
+
+### What is not exposed
+
+A few endpoints are documented in the spec but deliberately produce no tool: instance settings (branding, geocoding provider and API keys, update check, retention), whole-database export/import, bulk deletes and batch geocoding, health/version probes, and file uploads. They are marked `x-mcp-exclude` in the OpenAPI document, so the decision lives with the API rather than in this server. Login/logout are also skipped — the server manages its own session — and so are your own security settings (two-factor, passkeys, API tokens), which the API refuses to change with a token anyway.
+
+### Project scoping
+
+List tools for project-scoped records (people, businesses, cases, assets, crypto wallets, transactions, properties, todos, wireless networks, locations, search) accept `project_id`. A non-admin account sees only the projects it is a member of; asking for another project returns 403.
+
+### Duplicate protection
+
+`ghost_create_people` and `ghost_create_businesses` check for existing records with the same name (or alias) before creating, and refuse with a list of matches if any are found. `ghost_create_transactions` does the same for transactions that match an existing one on type, date, both parties and value — useful when re-running document imports (e.g. Form 700 batches). The LLM can retry with `ignorePossibleDuplicates: true` when it has verified the record is genuinely new. This guards against the common failure mode where an LLM inserts without searching first.
+
+### Session handling & respawn cache
+
+The server logs in with the configured credentials, holds the session cookie, and transparently re-authenticates if the session expires mid-conversation.
+
+Some MCP clients spawn a fresh server process per tool call, which would mean one login and one OpenAPI fetch per call. To keep respawns instant, the session cookie and the fetched spec are cached in `~/.ghost-mcp/` (directory mode `0700`, files `0600`, keyed per server + user). A stale cookie self-corrects through the re-login-on-401 path; the spec is refetched after `GHOST_MCP_SPEC_TTL` seconds (default 600). Set `GHOST_MCP_CACHE=off` to disable caching entirely (e.g. on shared machines).
+
+## Setup
+
+Requires Node.js ≥ 18 and a running GHOST instance (v2.8+, which serves `/api/openapi.json`).
+
+Keep this directory in step with the GHOST instance it talks to. GHOST 2.18.0 and later document file-upload endpoints in the spec, which MCP server v1.1 and earlier cannot parse and will fail on at startup — update `mcp/` when you update GHOST.
+
+```bash
+cd mcp
+npm install
+```
+
+### Sign-in
+
+Use a personal API token: in GHOST open **Settings → Security → API tokens**, create one, and pass it as `GHOST_API_TOKEN`. The token acts as your account, with your role and project access, and can be revoked there at any time. Accounts with two-factor sign-in must use a token, since a password alone can't finish their login.
+
+`GHOST_USERNAME` / `GHOST_PASSWORD` still work for accounts without two-factor, and are the only option against a GHOST backend older than 2.26, which has no tokens.
+
+### Claude Code
+
+```bash
+claude mcp add ghost \
+  --env GHOST_API_URL=http://localhost:3001/api \
+  --env GHOST_API_TOKEN=ghost_yourtoken \
+  -- node /path/to/GHOST-osint-crm/mcp/ghost-mcp.js
+```
+
+### Claude Desktop
+
+Add to `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "ghost": {
+      "command": "node",
+      "args": ["/path/to/GHOST-osint-crm/mcp/ghost-mcp.js"],
+      "env": {
+        "GHOST_API_URL": "http://localhost:3001/api",
+        "GHOST_API_TOKEN": "ghost_yourtoken"
+      }
+    }
+  }
+}
+```
+
+## Configuration
+
+| Env var | Default | Description |
+|---|---|---|
+| `GHOST_API_URL` | `http://localhost:3001/api` | Base URL of the GHOST backend API. The backend port only listens on the GHOST server itself; from another machine use the app's address, e.g. `http://ghost-server:8080/api` |
+| `GHOST_API_TOKEN` | — | Personal API token (Settings → Security). Required for accounts with two-factor sign-in |
+| `GHOST_USERNAME` | — | GHOST login username, if not using a token |
+| `GHOST_PASSWORD` | — | GHOST login password, if not using a token |
+| `GHOST_MCP_CACHE` | `on` | Set to `off` to disable the `~/.ghost-mcp` session/spec cache |
+| `GHOST_MCP_SPEC_TTL` | `600` | Seconds before a cached OpenAPI spec is refetched |
+
+Consider creating a dedicated non-admin GHOST user for the LLM, with its own token,: admin-only endpoints (users, audit logs, settings writes) will then return 403, which the tool descriptions flag with "(admin only)".
+
+## Credits
+
+Session handling and the duplicate-detection pattern are adapted from [@zbyte64](https://github.com/zbyte64)'s original `ghost-mcp.js` implementation shared in [issue #44](https://github.com/elm1nst3r/GHOST-osint-crm/issues/44).

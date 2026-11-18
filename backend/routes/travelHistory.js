@@ -3,16 +3,26 @@ const router = express.Router();
 const { pool } = require('../config/database');
 const { requireAuth } = require('../middleware/auth');
 const { validateIdParam } = require('../middleware/validation');
+const { validate, TravelHistoryCreateSchema, TravelHistoryUpdateSchema } = require('../middleware/schemas');
+const { apiLimiter } = require('../middleware/rateLimiters');
+const { requireProjectMember } = require('../utils/projectAccess');
 
+
+router.use(apiLimiter);
 // Get travel history for a person
 router.get('/people/:id/travel-history', requireAuth, validateIdParam, async (req, res) => {
   const personId = req.params.id;
 
   try {
+    const personCheck = await pool.query('SELECT project_id FROM people WHERE id = $1', [personId]);
+    if (personCheck.rows.length === 0) return res.status(404).json({ error: 'Person not found' });
+    const accessErr = await requireProjectMember(req, personCheck.rows[0].project_id);
+    if (accessErr) return res.status(403).json({ error: accessErr });
+
     const result = await pool.query(
       `SELECT * FROM travel_history
        WHERE person_id = $1
-       ORDER BY arrival_date DESC`,
+       ORDER BY arrival_date DESC, id DESC`,
       [personId]
     );
     res.json(result.rows);
@@ -23,7 +33,7 @@ router.get('/people/:id/travel-history', requireAuth, validateIdParam, async (re
 });
 
 // Create travel history entry
-router.post('/people/:id/travel-history', requireAuth, validateIdParam, async (req, res) => {
+router.post('/people/:id/travel-history', requireAuth, validateIdParam, validate(TravelHistoryCreateSchema), async (req, res) => {
   const personId = req.params.id;
 
   const {
@@ -33,18 +43,28 @@ router.post('/people/:id/travel-history', requireAuth, validateIdParam, async (r
 
   const parsedArrival = arrival_date ? new Date(arrival_date) : null;
   const parsedDeparture = departure_date ? new Date(departure_date) : null;
-  if (arrival_date && isNaN(parsedArrival)) return res.status(400).json({ error: 'Invalid arrival_date' });
-  if (departure_date && isNaN(parsedDeparture)) return res.status(400).json({ error: 'Invalid departure_date' });
 
   try {
+    // travel_history is always created as a sub-resource of a person (issue
+    // #83): it inherits project_id/case_id from the parent rather than
+    // taking them from the request body, same as locations.
+    const personResult = await pool.query('SELECT project_id, case_id FROM people WHERE id = $1', [personId]);
+    if (personResult.rows.length === 0) return res.status(404).json({ error: 'Person not found' });
+    const { project_id, case_id } = personResult.rows[0];
+
+    const accessErr = await requireProjectMember(req, project_id);
+    if (accessErr) return res.status(403).json({ error: accessErr });
+
     const result = await pool.query(
       `INSERT INTO travel_history
        (person_id, location_type, location_name, address, city, state, country, postal_code,
-        latitude, longitude, arrival_date, departure_date, purpose, transportation_mode, notes)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        latitude, longitude, arrival_date, departure_date, purpose, transportation_mode, notes,
+        project_id, case_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
        RETURNING *`,
       [personId, location_type, location_name, address, city, state, country, postal_code,
-       latitude, longitude, parsedArrival, parsedDeparture, purpose, transportation_mode, notes]
+       latitude, longitude, parsedArrival, parsedDeparture, purpose, transportation_mode, notes,
+       project_id, case_id]
     );
 
     res.status(201).json(result.rows[0]);
@@ -55,7 +75,7 @@ router.post('/people/:id/travel-history', requireAuth, validateIdParam, async (r
 });
 
 // Update travel history entry
-router.put('/travel-history/:id', requireAuth, validateIdParam, async (req, res) => {
+router.put('/travel-history/:id', requireAuth, validateIdParam, validate(TravelHistoryUpdateSchema), async (req, res) => {
   const travelId = req.params.id;
 
   const {
@@ -65,10 +85,13 @@ router.put('/travel-history/:id', requireAuth, validateIdParam, async (req, res)
 
   const parsedArrival = arrival_date ? new Date(arrival_date) : null;
   const parsedDeparture = departure_date ? new Date(departure_date) : null;
-  if (arrival_date && isNaN(parsedArrival)) return res.status(400).json({ error: 'Invalid arrival_date' });
-  if (departure_date && isNaN(parsedDeparture)) return res.status(400).json({ error: 'Invalid departure_date' });
 
   try {
+    const existing = await pool.query('SELECT project_id FROM travel_history WHERE id = $1', [travelId]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: 'Travel record not found' });
+    const accessErr = await requireProjectMember(req, existing.rows[0].project_id);
+    if (accessErr) return res.status(403).json({ error: accessErr });
+
     const result = await pool.query(
       `UPDATE travel_history
        SET location_type = $1, location_name = $2, address = $3, city = $4, state = $5,
@@ -94,6 +117,11 @@ router.delete('/travel-history/:id', requireAuth, validateIdParam, async (req, r
   const travelId = req.params.id;
 
   try {
+    const existing = await pool.query('SELECT project_id FROM travel_history WHERE id = $1', [travelId]);
+    if (existing.rows.length === 0) return res.status(404).json({ error: 'Travel record not found' });
+    const accessErr = await requireProjectMember(req, existing.rows[0].project_id);
+    if (accessErr) return res.status(403).json({ error: accessErr });
+
     const result = await pool.query('DELETE FROM travel_history WHERE id = $1 RETURNING *', [travelId]);
     if (result.rows.length === 0) return res.status(404).json({ error: 'Travel record not found' });
     res.json({ message: 'Travel record deleted successfully' });
@@ -108,10 +136,15 @@ router.get('/people/:id/travel-analysis', requireAuth, validateIdParam, async (r
   const personId = req.params.id;
 
   try {
+    const personCheck = await pool.query('SELECT project_id FROM people WHERE id = $1', [personId]);
+    if (personCheck.rows.length === 0) return res.status(404).json({ error: 'Person not found' });
+    const accessErr = await requireProjectMember(req, personCheck.rows[0].project_id);
+    if (accessErr) return res.status(403).json({ error: accessErr });
+
     const travelHistory = await pool.query(
       `SELECT * FROM travel_history
        WHERE person_id = $1
-       ORDER BY arrival_date ASC`,
+       ORDER BY arrival_date ASC, id ASC`,
       [personId]
     );
 
